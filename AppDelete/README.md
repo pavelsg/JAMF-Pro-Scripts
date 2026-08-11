@@ -48,6 +48,10 @@ AppDelete runs as root so non-admin users can remove approved items. The script 
 - The same validated selection snapshot is used for confirmation and deletion.
 - Every target is revalidated as an approved, non-symlinked direct child of `/Applications` before any item in the batch is deleted.
 - Protected-application policy is enforced during discovery and immediately before deletion.
+- The removal command status and the target's absence are checked before an item is recorded as deleted.
+- Successful and failed targets are logged and displayed separately. An ordinary filesystem failure does not prevent other already-validated targets from being attempted.
+- If batch safety validation fails, no target in that batch is attempted.
+- Any requested deletion failure makes the final AppDelete process status nonzero, including when the user retries and later closes or cancels the workflow.
 
 Run the security regression suite after changing discovery, selection, or deletion behavior:
 
@@ -100,3 +104,6 @@ and give them an option to do it again (and again)
 | 2.8 | Documented privileged Jamf policy dependencies and made dependency checks fail closed |
 || Renamed `install_SymFiles` to `install_BrandingAssets` for AppDelete |
 || Added configurable `BrandingAssetsDirectory` managed preference and strict local-path validation |
+| 2.9 | Added verified per-item success and failure tracking for deletion operations |
+|| Completion dialogs and logs now distinguish deleted items from items that remain |
+|| A deletion failure is preserved as a nonzero final process status across retries |

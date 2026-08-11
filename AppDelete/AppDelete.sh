@@ -33,6 +33,8 @@
 #       Recheck protection immediately before deletion and prevent ALLOWED_FOLDERS app bypasses
 # 2.8 - Document and fail closed on external Jamf policy dependencies
 #       Rename the branding-assets event and make its local asset directory configurable
+# 2.9 - Track and report successful and failed deletions independently
+#       Preserve a nonzero session result after any requested deletion fails
 ######################################################################################################
 #
 # Global "Common" variables
@@ -177,6 +179,7 @@ SD_ICON_FILE="SF=trash.fill, color=black, weight=light"
 # Jamf custom events used to install runtime dependencies
 
 JAMF_BINARY="/usr/local/bin/jamf"
+REMOVE_BINARY="/bin/rm"
 BRANDING_ASSETS_INSTALL_POLICY="install_BrandingAssets"
 DIALOG_INSTALL_POLICY="install_SwiftDialog"
 
@@ -371,12 +374,29 @@ function check_branding_assets ()
 
 function cleanup_and_exit ()
 {
-	# PURPOSE: Exit with the requested status. The EXIT trap removes temporary files.
+	# PURPOSE: Exit without allowing a prior deletion failure to be downgraded to success.
 	# PARMS: Optional exit status; defaults to 0.
 	# RETURN: Does not return.
 
-	local exit_status=${1:-0}
+	resolve_session_exit_status "${1:-0}"
+	local exit_status="${REPLY}"
 	exit "${exit_status}"
+}
+
+function resolve_session_exit_status ()
+{
+	# PURPOSE: Combine a requested exit status with the cumulative deletion-session result.
+	# PARMS: $1 - Requested exit status.
+	# RETURN: 0 with the effective numeric status in REPLY.
+
+	local requested_status="${1:-0}"
+
+	if (( requested_status == 0 && ${SESSION_HAD_DELETION_FAILURE:-0} != 0 )); then
+		REPLY=1
+	else
+		REPLY="${requested_status}"
+	fi
+	return 0
 }
 
 function create_infobox_message()
@@ -817,7 +837,7 @@ function show_final_delete_prompt ()
 {
 	# PURPOSE: Confirm the frozen selection and delete only that in-memory snapshot.
 	# PARMS: messagebody, CONFIRMED_ITEM_IDS
-	# RETURN: None; exits safely on cancellation, validation failure, or dialog error.
+	# RETURN: The deletion result; exits safely on cancellation or dialog error.
 
 	MainDialogBody=(
 		--message "Are you sure you want to delete these applications?\n\n${messagebody}"
@@ -841,10 +861,8 @@ function show_final_delete_prompt ()
 
 	case "${buttonpress}" in
 		0)
-			if ! delete_files; then
-				logMe "ERROR: One or more targets failed validation or could not be deleted."
-				cleanup_and_exit 1
-			fi
+			delete_files
+			return $?
 			;;
 		2|10)
 			cleanup_and_exit 0
@@ -856,74 +874,255 @@ function show_final_delete_prompt ()
 	esac
 }
 
-function delete_files () 
+function deletion_item_description ()
 {
-	# PURPOSE: Revalidate and delete the exact in-memory targets shown at confirmation.
-	# PARMS: CONFIRMED_ITEM_IDS and approved target maps.
-	# RETURN: 0 when all targets are valid and deleted; otherwise 1.
+	# PURPOSE: Produce a stable human-readable description for one approved item ID.
+	# PARMS: $1 - Opaque item ID.
+	# RETURN: 0 with the description in REPLY; otherwise 1 with a safe fallback in REPLY.
+
+	local item_id="$1"
+	local display_name
+	local target_type
+
+	if (( ! ${+APPROVED_LABELS[$item_id]} || ! ${+APPROVED_TYPES[$item_id]} )); then
+		REPLY="Selection ${item_id}"
+		return 1
+	fi
+
+	display_name="${APPROVED_LABELS[$item_id]}"
+	target_type="${APPROVED_TYPES[$item_id]}"
+	case "${target_type}" in
+		application) REPLY="Application: ${display_name}" ;;
+		folder) REPLY="Folder: ${display_name}" ;;
+		*)
+			REPLY="Selection ${item_id}"
+			return 1
+			;;
+	esac
+
+	return 0
+}
+
+function reset_deletion_results ()
+{
+	# PURPOSE: Clear result state before processing one confirmed deletion batch.
+	# PARMS: None
+	# RETURN: Always 0.
+
+	SUCCESSFUL_DELETION_IDS=()
+	FAILED_DELETION_IDS=()
+	DELETION_FAILURE_REASONS=()
+	DELETION_RESULT_MESSAGE=""
+	return 0
+}
+
+function record_deletion_success ()
+{
+	# PURPOSE: Record and log one target only after its removal is verified.
+	# PARMS: $1 - Opaque item ID.
+	# RETURN: Always 0.
+
+	local item_id="$1"
+	local description
+
+	SUCCESSFUL_DELETION_IDS+=("${item_id}")
+	deletion_item_description "${item_id}"
+	description="${REPLY}"
+	logMe "Removed ${description}"
+	return 0
+}
+
+function record_deletion_failure ()
+{
+	# PURPOSE: Record and log one target that was not safely deleted.
+	# PARMS: $1 - Opaque item ID; $2 - Failure reason.
+	# RETURN: Always 0.
+
+	local item_id="$1"
+	local failure_reason="$2"
+	local description
+
+	FAILED_DELETION_IDS+=("${item_id}")
+	DELETION_FAILURE_REASONS[$item_id]="${failure_reason}"
+	SESSION_HAD_DELETION_FAILURE=1
+	deletion_item_description "${item_id}"
+	description="${REPLY}"
+	logMe "ERROR: Did not remove ${description}: ${failure_reason}"
+	return 0
+}
+
+function build_deletion_result_message ()
+{
+	# PURPOSE: Build an accurate per-item completion summary from verified deletion results.
+	# PARMS: SUCCESSFUL_DELETION_IDS, FAILED_DELETION_IDS, DELETION_FAILURE_REASONS
+	# RETURN: 0 with DELETION_RESULT_MESSAGE populated.
 
 	local item_id
+	local description
+	local failure_reason
+
+	DELETION_RESULT_MESSAGE=""
+	if (( ${#SUCCESSFUL_DELETION_IDS} > 0 )); then
+		DELETION_RESULT_MESSAGE+="## Deleted"$'\n\n'
+		for item_id in "${SUCCESSFUL_DELETION_IDS[@]}"; do
+			deletion_item_description "${item_id}"
+			description="${REPLY}"
+			DELETION_RESULT_MESSAGE+="- ${description}"$'\n'
+		done
+	fi
+
+	if (( ${#FAILED_DELETION_IDS} > 0 )); then
+		[[ -n "${DELETION_RESULT_MESSAGE}" ]] && DELETION_RESULT_MESSAGE+=$'\n'
+		DELETION_RESULT_MESSAGE+="## Not deleted"$'\n\n'
+		for item_id in "${FAILED_DELETION_IDS[@]}"; do
+			deletion_item_description "${item_id}"
+			description="${REPLY}"
+			failure_reason="${DELETION_FAILURE_REASONS[$item_id]-Unknown deletion error.}"
+			DELETION_RESULT_MESSAGE+="- ${description}: ${failure_reason}"$'\n'
+		done
+	fi
+
+	[[ -z "${DELETION_RESULT_MESSAGE}" ]] && DELETION_RESULT_MESSAGE="No items were selected for deletion."
+	return 0
+}
+
+function delete_files () 
+{
+	# PURPOSE: Revalidate, delete, and record outcomes for the exact confirmed targets.
+	# PARMS: CONFIRMED_ITEM_IDS and approved target maps.
+	# RETURN: 0 when every requested target is verified absent; otherwise 1.
+
+	local item_id
+	local result_item_id
 	local target_path
-	local target_type
-	local display_name
+	local invalid_item_id=""
+	local failure_reason
+	local -i remove_status=0
+
+	reset_deletion_results
 
 	# Validate the entire batch before deleting anything so malformed state fails closed.
 	for item_id in "${CONFIRMED_ITEM_IDS[@]}"; do
 		if ! validate_approved_target "${item_id}"; then
-			logMe "ERROR: Refusing unapproved or changed deletion target ID: ${item_id}"
-			return 1
+			invalid_item_id="${item_id}"
+			break
 		fi
 	done
+
+	if [[ -n "${invalid_item_id}" ]]; then
+		for result_item_id in "${CONFIRMED_ITEM_IDS[@]}"; do
+			if [[ "${result_item_id}" == "${invalid_item_id}" ]]; then
+				failure_reason="Safety validation failed for this target; the batch was not attempted."
+			else
+				failure_reason="Deletion was not attempted because another target failed safety validation."
+			fi
+			record_deletion_failure "${result_item_id}" "${failure_reason}"
+		done
+		build_deletion_result_message
+		return 1
+	fi
 
 	for item_id in "${CONFIRMED_ITEM_IDS[@]}"; do
-		target_path="${APPROVED_TARGETS[$item_id]}"
-		target_type="${APPROVED_TYPES[$item_id]}"
-		display_name="${APPROVED_LABELS[$item_id]}"
-
-		if ! /bin/rm -rf -- "${target_path}"; then
-			logMe "ERROR: Failed to remove ${target_type}: ${display_name}"
-			return 1
+		# Revalidate immediately before each privileged removal to narrow replacement races.
+		if ! validate_approved_target "${item_id}"; then
+			record_deletion_failure "${item_id}" "Safety validation failed immediately before removal."
+			continue
 		fi
+
+		target_path="${APPROVED_TARGETS[$item_id]}"
+		"${REMOVE_BINARY}" -rf -- "${target_path}"
+		remove_status=$?
 
 		if [[ -e "${target_path}" || -L "${target_path}" ]]; then
-			logMe "ERROR: Target still exists after deletion: ${display_name}"
-			return 1
-		fi
-
-		if [[ "${target_type}" == "application" ]]; then
-			logMe "Removed application: ${display_name}"
+			if (( remove_status == 0 )); then
+				failure_reason="The removal command returned success, but the target still exists."
+			else
+				failure_reason="The removal command exited with status ${remove_status}, and the target still exists."
+			fi
+			record_deletion_failure "${item_id}" "${failure_reason}"
 		else
-			logMe "Removed Folder: ${display_name}"
+			record_deletion_success "${item_id}"
+			if (( remove_status != 0 )); then
+				logMe "WARNING: Removal command exited with status ${remove_status}, but verified that the target is absent."
+			fi
 		fi
 	done
 
+	build_deletion_result_message
+	(( ${#FAILED_DELETION_IDS} == 0 ))
+}
+
+function configure_completion_dialog ()
+{
+	# PURPOSE: Configure the completion dialog from verified success and failure results.
+	# PARMS: DELETION_RESULT_MESSAGE and deletion result arrays.
+	# RETURN: Always 0 with MainDialogBody populated.
+
+	local completion_summary
+	local overlay_icon
+	local secondary_button_text
+
+	if (( ${#FAILED_DELETION_IDS} > 0 )); then
+		if (( ${#SUCCESSFUL_DELETION_IDS} > 0 )); then
+			completion_summary="Some selected items were deleted, but others could not be deleted."
+		else
+			completion_summary="The selected items could not be deleted."
+		fi
+		overlay_icon="SF=exclamationmark.triangle.fill,color=red,weight=light,bgcolor=none"
+		secondary_button_text="Try Again"
+	elif (( ${#SUCCESSFUL_DELETION_IDS} > 0 )); then
+		completion_summary="All selected items were deleted successfully."
+		overlay_icon="SF=checkmark.circle.fill,color=green,weight=light,bgcolor=none"
+		secondary_button_text="Run Again"
+	else
+		completion_summary="No deletion was requested."
+		overlay_icon="SF=info.circle.fill,color=blue,weight=light,bgcolor=none"
+		secondary_button_text="Run Again"
+	fi
+
+	MainDialogBody=(
+		--message "${completion_summary}"$'\n\n'"${DELETION_RESULT_MESSAGE}"
+		--ontop
+		--icon "${SD_ICON_FILE}"
+		--bannerimage "${SD_BANNER_IMAGE}"
+		--bannertitle "${SD_WINDOW_TITLE}"
+		--subtitle "${BANNER_SUBTITLE}"
+		--titlefont "shadow=1, offset=${BANNER_TEXT_PADDING}, color=${BANNER_TEXT_COLOR:l}"
+		--overlayicon "${overlay_icon}"
+		--width 920
+		--quitkey 0
+		--buttonstyle center
+		--button1text "Close"
+		--button2text "${secondary_button_text}"
+	)
 	return 0
 }
 
 function show_completed_prompt ()
 {
-	MainDialogBody=(
-		--message "The following application(s) have been deleted.<br><br>${messagebody}\n\nIf you need to delete more files, you can choose \"Run Again\" below."
-		--ontop 
-		--icon "${SD_ICON_FILE}"
-		--bannerimage "${SD_BANNER_IMAGE}"
-		--bannertitle "${SD_WINDOW_TITLE}"
-		--subtitle "${BANNER_SUBTITLE}"
-        --titlefont "shadow=1, offset=${BANNER_TEXT_PADDING}, color=${BANNER_TEXT_COLOR:l}"
-		--overlayicon "SF=checkmark.circle.fill,color=auto,weight=light,bgcolor=none"
-		--width 920
-		--quitkey 0
-		--buttonstyle center
-		--button1text "OK"
-		--button2text "Run Again"
-	)
+	# PURPOSE: Display verified deletion results and preserve the cumulative session status.
+	# PARMS: MainDialogBody, SESSION_HAD_DELETION_FAILURE
+	# RETURN: 0 to run another selection cycle; otherwise exits through cleanup_and_exit.
+
+	configure_completion_dialog
 
 	# Show the dialog screen and allow the user to choose
 
 	"${SW_DIALOG}" "${MainDialogBody[@]}" 2>/dev/null
 	buttonpress=$?
 
-	[[ ${buttonpress} -eq 0 || ${buttonpress} -eq 10 ]] && cleanup_and_exit
+	case "${buttonpress}" in
+		0|10)
+			cleanup_and_exit "${SESSION_HAD_DELETION_FAILURE}"
+			;;
+		2)
+			return 0
+			;;
+		*)
+			logMe "ERROR: Completion dialog exited unexpectedly with status ${buttonpress}."
+			cleanup_and_exit 1
+			;;
+	esac
 }
 
 #############################
@@ -935,13 +1134,18 @@ function show_completed_prompt ()
 typeset -ga FILES_LIST
 typeset -ga SELECTED_ITEM_IDS
 typeset -ga CONFIRMED_ITEM_IDS
+typeset -ga SUCCESSFUL_DELETION_IDS
+typeset -ga FAILED_DELETION_IDS
 typeset -gA CANDIDATE_TYPES
 typeset -gA APPROVED_TARGETS
 typeset -gA APPROVED_LABELS
 typeset -gA APPROVED_TYPES
 typeset -gA PROTECTED_APP_NAMES
+typeset -gA DELETION_FAILURE_REASONS
 typeset -gi PROTECTED_POLICY_READY=0
+typeset -gi SESSION_HAD_DELETION_FAILURE=0
 typeset -g messagebody
+typeset -g DELETION_RESULT_MESSAGE
 
 # Loading this file for unit tests exposes functions without running the Jamf workflow.
 [[ ${APPDELETE_IS_SOURCED} -eq 1 ]] && return 0

@@ -70,6 +70,54 @@ function assert_equal ()
 	[[ "${actual}" == "${expected}" ]] || fail "${context}: expected '${expected}', got '${actual}'"
 }
 
+function assert_contains ()
+{
+	# PURPOSE: Assert that a string contains one literal substring.
+	# PARMS: $1 - Expected substring; $2 - Actual string; $3 - Context.
+	# RETURN: 0 when present; otherwise 1.
+
+	local expected_substring="$1"
+	local actual="$2"
+	local context="$3"
+
+	[[ "${actual}" == *"${expected_substring}"* ]] || fail "${context}: missing '${expected_substring}'"
+}
+
+function assert_log_contains ()
+{
+	# PURPOSE: Assert that one captured log message contains a literal substring.
+	# PARMS: $1 - Expected substring.
+	# RETURN: 0 when found; otherwise 1.
+
+	local expected_substring="$1"
+	local log_message
+
+	for log_message in "${TEST_LOG_MESSAGES[@]}"; do
+		[[ "${log_message}" == *"${expected_substring}"* ]] && return 0
+	done
+
+	fail "Expected log message containing: ${expected_substring}"
+}
+
+function assert_log_absent ()
+{
+	# PURPOSE: Assert that no captured log message contains a literal substring.
+	# PARMS: $1 - Disallowed substring.
+	# RETURN: 0 when absent; otherwise 1.
+
+	local disallowed_substring="$1"
+	local log_message
+
+	for log_message in "${TEST_LOG_MESSAGES[@]}"; do
+		if [[ "${log_message}" == *"${disallowed_substring}"* ]]; then
+			fail "Unexpected log message containing: ${disallowed_substring}"
+			return 1
+		fi
+	done
+
+	return 0
+}
+
 function assert_exists ()
 {
 	# PURPOSE: Assert that a filesystem path exists, including symbolic links.
@@ -139,16 +187,23 @@ function reset_fixture ()
 	FILES_LIST=()
 	SELECTED_ITEM_IDS=()
 	CONFIRMED_ITEM_IDS=()
+	SUCCESSFUL_DELETION_IDS=()
+	FAILED_DELETION_IDS=()
 	CANDIDATE_TYPES=()
 	APPROVED_TARGETS=()
 	APPROVED_LABELS=()
 	APPROVED_TYPES=()
 	PROTECTED_APP_NAMES=()
+	DELETION_FAILURE_REASONS=()
 	PROTECTED_POLICY_READY=0
+	SESSION_HAD_DELETION_FAILURE=0
 	TEST_LOG_MESSAGES=()
 	messagebody=""
+	DELETION_RESULT_MESSAGE=""
+	REMOVE_BINARY="/bin/rm"
 	NOT_ALLOWED_APPS=("Company Portal" "Falcon" "Jamf Connect" "Self Service" "Self Service+" "ZScaler")
 	ALLOWED_FOLDERS=()
+	unset APPDELETE_TEST_REMOVE_FAIL_TARGET APPDELETE_TEST_REMOVE_NOOP_TARGET APPDELETE_TEST_REMOVE_EXIT
 
 	/bin/mkdir -p "${APPLICATIONS_DIR}"
 }
@@ -196,6 +251,26 @@ function create_mock_jamf_binary ()
 	print -r -- '    /bin/chmod 700 "${APPDELETE_TEST_DIALOG}" || exit 95' >> "${mock_path}" || return 1
 	print -r -- 'fi' >> "${mock_path}" || return 1
 	print -r -- 'exit "${APPDELETE_TEST_JAMF_EXIT:-0}"' >> "${mock_path}" || return 1
+	/bin/chmod 700 "${mock_path}"
+}
+
+function create_mock_remove_binary ()
+{
+	# PURPOSE: Create an isolated rm command double with deterministic failure/no-op targets.
+	# PARMS: $1 - Mock binary path.
+	# RETURN: 0 when the executable mock is ready; otherwise 1.
+
+	local mock_path="$1"
+
+	print -r -- '#!/bin/zsh' > "${mock_path}" || return 1
+	print -r -- 'target_path="${argv[-1]}"' >> "${mock_path}" || return 1
+	print -r -- 'if [[ -n "${APPDELETE_TEST_REMOVE_FAIL_TARGET:-}" && "${target_path}" == "${APPDELETE_TEST_REMOVE_FAIL_TARGET}" ]]; then' >> "${mock_path}" || return 1
+	print -r -- '    exit "${APPDELETE_TEST_REMOVE_EXIT:-1}"' >> "${mock_path}" || return 1
+	print -r -- 'fi' >> "${mock_path}" || return 1
+	print -r -- 'if [[ -n "${APPDELETE_TEST_REMOVE_NOOP_TARGET:-}" && "${target_path}" == "${APPDELETE_TEST_REMOVE_NOOP_TARGET}" ]]; then' >> "${mock_path}" || return 1
+	print -r -- '    exit 0' >> "${mock_path}" || return 1
+	print -r -- 'fi' >> "${mock_path}" || return 1
+	print -r -- 'exec /bin/rm "$@"' >> "${mock_path}" || return 1
 	/bin/chmod 700 "${mock_path}"
 }
 
@@ -613,7 +688,10 @@ function test_tampered_target_map_fails_before_any_deletion ()
 	assert_failure delete_files || return 1
 	assert_exists "${app_path}" || return 1
 	assert_exists "${folder_path}" || return 1
-	assert_exists "${outside_path}"
+	assert_exists "${outside_path}" || return 1
+	assert_equal "0" "${#SUCCESSFUL_DELETION_IDS}" "successful result count after batch validation failure" || return 1
+	assert_equal "2" "${#FAILED_DELETION_IDS}" "failed result count after batch validation failure" || return 1
+	assert_equal "1" "${SESSION_HAD_DELETION_FAILURE}" "session failure status"
 }
 
 function test_target_replaced_by_symlink_is_rejected ()
@@ -673,7 +751,128 @@ function test_valid_allowed_folder_deletion ()
 	parse_dialog_selection "${output}" || return 1
 	prepare_confirmation || return 1
 	delete_files || return 1
-	assert_not_exists "${folder_path}"
+	assert_not_exists "${folder_path}" || return 1
+	assert_equal "1" "${#SUCCESSFUL_DELETION_IDS}" "successful deletion count" || return 1
+	assert_equal "0" "${#FAILED_DELETION_IDS}" "failed deletion count" || return 1
+	assert_equal "${item_id}" "${SUCCESSFUL_DELETION_IDS[1]}" "successful folder ID" || return 1
+	assert_contains "## Deleted" "${DELETION_RESULT_MESSAGE}" "success result heading" || return 1
+	assert_contains "Folder: Vendor Tools" "${DELETION_RESULT_MESSAGE}" "success result item" || return 1
+	assert_log_contains "Removed Folder: Vendor Tools"
+}
+
+function test_mixed_deletion_results_are_reported_per_item ()
+{
+	# PURPOSE: Verify one rm failure does not conceal a successful peer or stop safe processing.
+	# PARMS: None
+	# RETURN: 0 when success/failure state, logs, UI text, and session status are accurate.
+
+	local calculator_path
+	local textedit_path
+	local calculator_id
+	local textedit_id
+	local output
+	local mock_remove=""
+	local dialog_arguments
+
+	reset_fixture || return 1
+	calculator_path="${APPLICATIONS_DIR}/Calculator.app"
+	textedit_path="${APPLICATIONS_DIR}/TextEdit.app"
+	mock_remove="${TEST_ROOT}/mock-rm-mixed"
+	create_test_app "Calculator" || return 1
+	create_test_app "TextEdit" || return 1
+	prepare_dialog_configuration || return 1
+	find_item_id_by_label "Calculator" || return 1
+	calculator_id="${REPLY}"
+	find_item_id_by_label "TextEdit" || return 1
+	textedit_id="${REPLY}"
+	dialog_output_for_selection "${calculator_id}" "${textedit_id}"
+	output="${REPLY}"
+	parse_dialog_selection "${output}" || return 1
+	prepare_confirmation || return 1
+	create_mock_remove_binary "${mock_remove}" || return 1
+	REMOVE_BINARY="${mock_remove}"
+	export APPDELETE_TEST_REMOVE_FAIL_TARGET="${textedit_path}"
+	export APPDELETE_TEST_REMOVE_EXIT=23
+
+	assert_failure delete_files || return 1
+	assert_not_exists "${calculator_path}" || return 1
+	assert_exists "${textedit_path}" || return 1
+	assert_equal "1" "${#SUCCESSFUL_DELETION_IDS}" "mixed successful count" || return 1
+	assert_equal "1" "${#FAILED_DELETION_IDS}" "mixed failed count" || return 1
+	assert_equal "${calculator_id}" "${SUCCESSFUL_DELETION_IDS[1]}" "mixed successful ID" || return 1
+	assert_equal "${textedit_id}" "${FAILED_DELETION_IDS[1]}" "mixed failed ID" || return 1
+	assert_equal "1" "${SESSION_HAD_DELETION_FAILURE}" "mixed session failure status" || return 1
+	assert_contains "status 23" "${DELETION_FAILURE_REASONS[$textedit_id]}" "rm failure reason" || return 1
+	assert_contains "## Deleted" "${DELETION_RESULT_MESSAGE}" "mixed success heading" || return 1
+	assert_contains "Application: Calculator" "${DELETION_RESULT_MESSAGE}" "mixed success item" || return 1
+	assert_contains "## Not deleted" "${DELETION_RESULT_MESSAGE}" "mixed failure heading" || return 1
+	assert_contains "Application: TextEdit" "${DELETION_RESULT_MESSAGE}" "mixed failure item" || return 1
+	assert_log_contains "Removed Application: Calculator" || return 1
+	assert_log_contains "Did not remove Application: TextEdit" || return 1
+	assert_log_absent "Removed Application: TextEdit" || return 1
+
+	configure_completion_dialog || return 1
+	dialog_arguments="${(j:\n:)MainDialogBody}"
+	assert_contains "Some selected items were deleted" "${dialog_arguments}" "partial-failure dialog summary" || return 1
+	assert_contains "SF=exclamationmark.triangle.fill" "${dialog_arguments}" "partial-failure dialog icon" || return 1
+	assert_contains "Try Again" "${dialog_arguments}" "partial-failure dialog action"
+}
+
+function test_successful_rm_with_remaining_target_is_failure ()
+{
+	# PURPOSE: Verify the filesystem postcondition overrides a misleading zero rm status.
+	# PARMS: None
+	# RETURN: 0 when a remaining target is reported as failed and the session is nonzero.
+
+	local app_path
+	local item_id
+	local output
+	local mock_remove="${TEST_ROOT}/mock-rm-noop"
+
+	reset_fixture || return 1
+	app_path="${APPLICATIONS_DIR}/Calculator.app"
+	create_test_app "Calculator" || return 1
+	prepare_dialog_configuration || return 1
+	find_item_id_by_label "Calculator" || return 1
+	item_id="${REPLY}"
+	dialog_output_for_selection "${item_id}"
+	output="${REPLY}"
+	parse_dialog_selection "${output}" || return 1
+	prepare_confirmation || return 1
+	create_mock_remove_binary "${mock_remove}" || return 1
+	REMOVE_BINARY="${mock_remove}"
+	export APPDELETE_TEST_REMOVE_NOOP_TARGET="${app_path}"
+
+	assert_failure delete_files || return 1
+	assert_exists "${app_path}" || return 1
+	assert_equal "0" "${#SUCCESSFUL_DELETION_IDS}" "no-op successful count" || return 1
+	assert_equal "1" "${#FAILED_DELETION_IDS}" "no-op failed count" || return 1
+	assert_contains "returned success" "${DELETION_FAILURE_REASONS[$item_id]}" "postcondition failure reason" || return 1
+	assert_log_absent "Removed Application: Calculator"
+}
+
+function test_session_exit_status_preserves_prior_failure ()
+{
+	# PURPOSE: Verify a later retry or cancellation cannot hide an earlier deletion failure.
+	# PARMS: None
+	# RETURN: 0 when successful sessions resolve to 0 and failed sessions exit nonzero.
+
+	local subprocess_status
+
+	reset_fixture || return 1
+	resolve_session_exit_status 0 || return 1
+	assert_equal "0" "${REPLY}" "clean session exit status" || return 1
+
+	SESSION_HAD_DELETION_FAILURE=1
+	resolve_session_exit_status 0 || return 1
+	assert_equal "1" "${REPLY}" "failed session exit status" || return 1
+
+	resolve_session_exit_status 7 || return 1
+	assert_equal "7" "${REPLY}" "existing nonzero exit status" || return 1
+
+	/bin/zsh -c 'source "$1" >/dev/null || exit 99; SESSION_HAD_DELETION_FAILURE=1; cleanup_and_exit 0' appdelete-exit-test "${APPDELETE_SCRIPT}"
+	subprocess_status=$?
+	assert_equal "1" "${subprocess_status}" "failed AppDelete subprocess status"
 }
 
 function test_default_branding_configuration_contract ()
@@ -912,6 +1111,9 @@ run_test test_confirmation_snapshot_ignores_legacy_selection_file
 run_test test_tampered_target_map_fails_before_any_deletion
 run_test test_target_replaced_by_symlink_is_rejected
 run_test test_valid_allowed_folder_deletion
+run_test test_mixed_deletion_results_are_reported_per_item
+run_test test_successful_rm_with_remaining_target_is_failure
+run_test test_session_exit_status_preserves_prior_failure
 run_test test_default_branding_configuration_contract
 run_test test_custom_branding_directory_is_resolved
 run_test test_absolute_banner_path_is_preserved

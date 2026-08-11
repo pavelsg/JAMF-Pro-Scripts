@@ -10,7 +10,7 @@
 
 ### Remediation update
 
-AD-001 and AD-002 were remediated after the original audit. AD-003 repository-side remediation was implemented in the current working tree on 2026-08-11. The original findings below describe commit `43b3561`; each "Remediation implemented" section records the replacement behavior and verification results. Jamf Pro policy definitions remain outside the repository and require deployment-specific review.
+AD-001 and AD-002 were remediated after the original audit. AD-003 and AD-004 repository-side remediations were implemented in the current working tree on 2026-08-11. The original findings below describe commit `43b3561`; each "Remediation implemented" section records the replacement behavior and verification results. Jamf Pro policy definitions remain outside the repository and require deployment-specific review.
 
 ## Executive summary
 
@@ -129,7 +129,7 @@ Verification command:
 zsh AppDelete/tests/AppDeleteSecurityTests.zsh
 ```
 
-Current full-suite result: `30 passed; 0 failed`.
+Current full-suite result: `33 passed; 0 failed`.
 
 ### AD-002: The protected-application control is unreliable and incorrectly documented
 
@@ -174,7 +174,7 @@ The script does not enforce the protected-app list again at deletion time. It mu
 - Prevented names ending in `.app` from being reintroduced through `ALLOWED_FOLDERS`.
 - Added regression tests for case variants, exact-versus-substring behavior, special characters, duplicate normalized names, invalid configuration, deletion-time enforcement, and folder-list bypasses.
 
-Verification result: `30 passed; 0 failed`.
+Verification result: `33 passed; 0 failed`.
 
 ### AD-003: The script invokes opaque Jamf policies not documented in the README
 
@@ -211,15 +211,15 @@ Repository-wide usage shows that the legacy `install_SymFiles` event is intended
 - Check the Jamf command result and verify the required Swift Dialog or banner postcondition. AppDelete exits nonzero before showing deletion choices if either dependency remains unavailable.
 - Added isolated regression tests for default and custom branding paths, invalid configurations, renamed event arguments, nonzero policy results, and successful policies that fail to install the expected dependency.
 
-Verification result: `30 passed; 0 failed`.
+Verification result: `33 passed; 0 failed`.
 
 The actual `install_SwiftDialog` and `install_BrandingAssets` policy payloads cannot be verified from this repository. Their server-side review remains a release prerequisite rather than a code remediation item.
 
 ### AD-004: Deletion failures are logged and displayed as successes
 
 - Severity: Low
-- Status: Remediated in the current working tree as part of the fail-closed deletion flow
-- Affected lines: 365-405
+- Status: Remediated in the current working tree; pending staged-device UI verification
+- Affected lines in the remediated script: 836-1130, 1185-1186
 
 The return status from `rm` is ignored. The script logs `Removed application` or `Removed Folder` immediately after the command, even when the deletion failed. The completion dialog then says that the listed items were deleted.
 
@@ -232,6 +232,18 @@ This can conceal permission failures, immutable files, filesystem errors, or par
 - Track successful and failed targets separately.
 - Show and log an accurate per-target result.
 - Return a nonzero script status when any requested deletion fails.
+
+#### Remediation implemented
+
+- Added independent per-batch collections for verified successes, failures, and per-item failure reasons.
+- Retained whole-batch validation before the first removal and added another safety validation immediately before each privileged removal.
+- Check the removal command status and then independently verify that the target is absent. An item is logged as removed only after that postcondition succeeds.
+- Continue processing other already-validated targets after an ordinary removal or postcondition failure, allowing an accurate partial-success result.
+- Replaced the unconditional success dialog with completion content generated from verified results. Successful and failed items appear under separate headings, failed items include a reason, and failure results use an error icon and a `Try Again` action.
+- Preserve a cumulative session-failure flag. Once any requested deletion fails, every later exit path resolves to a nonzero status even if the user retries or cancels afterward.
+- Added deterministic regression tests for partial success, nonzero removal-command status, a misleading zero status with a remaining target, accurate logs/dialog options, whole-batch validation failure, and cumulative process status.
+
+Verification result: `33 passed; 0 failed`.
 
 ### AD-005: Hand-built JSON and text parsing mishandle valid application names
 
