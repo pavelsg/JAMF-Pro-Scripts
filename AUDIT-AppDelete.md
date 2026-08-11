@@ -129,7 +129,7 @@ Verification command:
 zsh AppDelete/tests/AppDeleteSecurityTests.zsh
 ```
 
-Current full-suite result: `38 passed; 0 failed`.
+Current full-suite result: `43 passed; 0 failed`.
 
 ### AD-002: The protected-application control is unreliable and incorrectly documented
 
@@ -174,7 +174,7 @@ The script does not enforce the protected-app list again at deletion time. It mu
 - Prevented names ending in `.app` from being reintroduced through `ALLOWED_FOLDERS`.
 - Added regression tests for case variants, exact-versus-substring behavior, special characters, duplicate normalized names, invalid configuration, deletion-time enforcement, and folder-list bypasses.
 
-Verification result: `38 passed; 0 failed`.
+Verification result: `43 passed; 0 failed`.
 
 ### AD-003: The script invokes opaque Jamf policies not documented in the README
 
@@ -211,7 +211,7 @@ Repository-wide usage shows that the legacy `install_SymFiles` event is intended
 - Check the Jamf command result and verify the required Swift Dialog or banner postcondition. AppDelete exits nonzero before showing deletion choices if either dependency remains unavailable.
 - Added isolated regression tests for default and custom branding paths, invalid configurations, renamed event arguments, nonzero policy results, and successful policies that fail to install the expected dependency.
 
-Verification result: `38 passed; 0 failed`.
+Verification result: `43 passed; 0 failed`.
 
 The actual `install_SwiftDialog` and `install_BrandingAssets` policy payloads cannot be verified from this repository. Their server-side review remains a release prerequisite rather than a code remediation item.
 
@@ -243,7 +243,7 @@ This can conceal permission failures, immutable files, filesystem errors, or par
 - Preserve a cumulative session-failure flag. Once any requested deletion fails, every later exit path resolves to a nonzero status even if the user retries or cancels afterward.
 - Added deterministic regression tests for partial success, nonzero removal-command status, a misleading zero status with a remaining target, accurate logs/dialog options, whole-batch validation failure, and cumulative process status.
 
-Verification result: `38 passed; 0 failed`.
+Verification result: `43 passed; 0 failed`.
 
 ### AD-005: Hand-built JSON and text parsing mishandle valid application names
 
@@ -276,13 +276,13 @@ The application scan removes `.app` using the regular expression delimiter `.app
 - Added a fail-closed startup probe for `/usr/bin/jq`. This fleet's oldest Mac supplies the Apple binary as part of its operating-system baseline, so AppDelete does not invoke another installation policy.
 - Added regression coverage for exact unusual-label preservation, compact and reordered JSON, malformed input, arrays/scalars, nested and non-Boolean values, multiple JSON documents, partial-state cleanup, oversized responses, duplicate keys, and missing parser behavior.
 
-Verification result: `38 passed; 0 failed`.
+Verification result: `43 passed; 0 failed`.
 
 ### AD-006: Temporary files can survive interrupted execution
 
 - Severity: Low
-- Status: Remediated in the current working tree with mode `0600` state and exit/signal cleanup traps
-- Affected lines: 199-204 and 414-435
+- Status: Remediated in the current working tree; pending commit and staged-device interruption verification
+- Affected lines: current `create_secure_temp_file`, `cleanup_temp_files`, and process-lifecycle handlers
 
 Temporary files are removed only through `cleanup_and_exit`. The script does not install traps for interruption, termination, or abnormal exits. Temporary files can therefore remain in `/var/tmp`; the selection file may remain world-readable and world-writable.
 
@@ -293,6 +293,19 @@ The stored information is normally limited to application or folder names, but l
 - Register an `EXIT`, `INT`, `TERM`, and `HUP` cleanup trap.
 - Keep temporary files mode `0600`.
 - Use `rm -f --` for known regular temporary files rather than recursive removal.
+
+#### Remediation implemented
+
+- Register the exact path returned by `mktemp` only after creation and mode `0600` enforcement succeed. Cleanup also considers the separately constrained active-path variable, closing the interruption window between `mktemp` publishing the path and registry insertion. Selection state remains in memory and is never part of the temporary configuration file.
+- Clear the live registry before cleanup and tolerate already-absent files, making cleanup idempotent and safe across repeated exit paths.
+- Before removal, require every registered target to be an absolute direct child of the configured temporary directory with AppDelete's exact five-character `mktemp` basename pattern.
+- Refuse unexpected parent paths, directories, symbolic links, and other non-regular targets. Cleanup uses only `/bin/rm -f --` and never recursive removal.
+- Install dedicated `EXIT`, `HUP`, `INT`, and `TERM` handlers before creating temporary state. Normal and signal exits remove registered files while preserving the original or conventional `128 + signal` process status; cleanup failure changes an otherwise successful exit to failure.
+- Add subprocess regression coverage for ordinary exit and self-delivered `HUP`, `INT`, and `TERM`, plus ownership, path/type guardrail, and idempotence coverage.
+
+`SIGKILL`, kernel termination, kernel panic, and sudden power loss cannot execute a shell trap. AppDelete therefore cannot promise cleanup for those cases. The remaining exposure is bounded: a residual file has mode `0600`, contains only Swift Dialog configuration, contains no user selection, and has an unpredictable name. Broad startup scavenging was intentionally not added because it could race with a concurrent AppDelete process and would widen the privileged deletion scope.
+
+Verification result: `43 passed; 0 failed`.
 
 ## Documented and observed deletion scope
 

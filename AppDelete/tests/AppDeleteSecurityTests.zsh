@@ -184,6 +184,7 @@ function reset_fixture ()
 	TEMP_DIR="${fixture_dir}"
 	LOG_FILE="${fixture_dir}/AppDelete.log"
 	JSON_OPTIONS=""
+	OWNED_TEMP_FILES=()
 	FILES_LIST=()
 	SELECTED_ITEM_IDS=()
 	CONFIRMED_ITEM_IDS=()
@@ -357,13 +358,146 @@ function run_test ()
 
 function test_secure_temp_file_permissions ()
 {
-	# PURPOSE: Verify dialog configuration state is private to the invoking account.
+	# PURPOSE: Verify dialog configuration state is private and registered for cleanup.
 	# PARMS: None
-	# RETURN: 0 when mode 0600 is enforced; otherwise 1.
+	# RETURN: 0 when mode 0600 and ownership registration are enforced; otherwise 1.
 
 	reset_fixture || return 1
 	create_secure_temp_file || return 1
-	assert_equal "600" "$(/usr/bin/stat -f '%Lp' "${JSON_OPTIONS}")" "temporary-file mode"
+	assert_equal "600" "$(/usr/bin/stat -f '%Lp' "${JSON_OPTIONS}")" "temporary-file mode" || return 1
+	assert_equal "1" "${#OWNED_TEMP_FILES}" "registered temporary-file count" || return 1
+	assert_equal "${JSON_OPTIONS}" "${OWNED_TEMP_FILES[1]}" "registered temporary-file path"
+}
+
+function test_temp_cleanup_is_constrained_and_idempotent ()
+{
+	# PURPOSE: Verify cleanup removes its registered file once without touching unrelated files.
+	# PARMS: None
+	# RETURN: 0 when cleanup is constrained, complete, and repeatable; otherwise 1.
+
+	local temp_path
+	local pending_temp_path
+	local unrelated_path
+
+	reset_fixture || return 1
+	create_secure_temp_file || return 1
+	temp_path="${JSON_OPTIONS}"
+	unrelated_path="${TEMP_DIR}/unrelated-state"
+	: > "${unrelated_path}" || return 1
+
+	cleanup_temp_files || return 1
+	assert_not_exists "${temp_path}" || return 1
+	assert_exists "${unrelated_path}" || return 1
+	assert_equal "0" "${#OWNED_TEMP_FILES}" "registered temporary files after cleanup" || return 1
+	assert_equal "" "${JSON_OPTIONS}" "active temporary path after cleanup" || return 1
+	assert_success cleanup_temp_files || return 1
+
+	# Simulate interruption after mktemp publishes the active path but before registration.
+	pending_temp_path=$(/usr/bin/mktemp "${TEMP_DIR}/${SCRIPT_NAME}.XXXXX") || return 1
+	JSON_OPTIONS="${pending_temp_path}"
+	OWNED_TEMP_FILES=()
+	cleanup_temp_files || return 1
+	assert_not_exists "${pending_temp_path}"
+}
+
+function test_temp_cleanup_rejects_unexpected_targets ()
+{
+	# PURPOSE: Verify poisoned cleanup state cannot delete outside files, directories, or symlinks.
+	# PARMS: None
+	# RETURN: 0 when every unexpected target is retained and cleanup fails closed; otherwise 1.
+
+	local outside_path
+	local directory_path
+	local symlink_path
+
+	reset_fixture || return 1
+	outside_path="${APPLICATIONS_DIR}/AppDelete.ABCDE"
+	directory_path="${TEMP_DIR}/AppDelete.FGHIJ"
+	symlink_path="${TEMP_DIR}/AppDelete.KLMNO"
+	: > "${outside_path}" || return 1
+	/bin/mkdir -p "${directory_path}/nested" || return 1
+	/bin/ln -s "${outside_path}" "${symlink_path}" || return 1
+
+	OWNED_TEMP_FILES=("${outside_path}" "${directory_path}" "${symlink_path}")
+	JSON_OPTIONS="${outside_path}"
+	assert_failure cleanup_temp_files 2>/dev/null || return 1
+	assert_exists "${outside_path}" || return 1
+	assert_exists "${directory_path}" || return 1
+	assert_exists "${symlink_path}" || return 1
+	assert_equal "0" "${#OWNED_TEMP_FILES}" "registered files after rejected cleanup" || return 1
+	assert_equal "" "${JSON_OPTIONS}" "active path after rejected cleanup"
+}
+
+function test_exit_trap_cleans_temp_and_preserves_status ()
+{
+	# PURPOSE: Verify an ordinary shell exit removes the registered file without hiding its status.
+	# PARMS: None
+	# RETURN: 0 when exit status 7 is preserved and the child temporary file is absent.
+
+	local record_path
+	local child_temp_path
+	local child_status
+
+	reset_fixture || return 1
+	record_path="${TEMP_DIR}/normal-exit-temp-path"
+	/bin/zsh -c 'source "$1" >/dev/null || exit 99; TEMP_DIR="$2"; OWNED_TEMP_FILES=(); trap '\''handle_process_exit $?'\'' EXIT; trap '\''handle_termination_signal 129'\'' HUP; trap '\''handle_termination_signal 130'\'' INT; trap '\''handle_termination_signal 143'\'' TERM; create_secure_temp_file || exit 98; print -r -- "$JSON_OPTIONS" > "$3"; exit 7' appdelete-temp-exit-test "${APPDELETE_SCRIPT}" "${TEMP_DIR}" "${record_path}"
+	child_status=$?
+
+	assert_equal "7" "${child_status}" "normal-exit status" || return 1
+	assert_exists "${record_path}" || return 1
+	child_temp_path="$(<"${record_path}")"
+	assert_not_exists "${child_temp_path}"
+}
+
+function test_signal_traps_clean_temp_and_preserve_status ()
+{
+	# PURPOSE: Verify HUP, INT, and TERM remove registered files and retain conventional statuses.
+	# PARMS: None
+	# RETURN: 0 when every catchable signal cleans its child file and returns 128 plus signal.
+
+	local signal_case
+	local signal_name
+	local expected_status
+	local record_path
+	local child_temp_path
+	local child_status
+
+	reset_fixture || return 1
+	for signal_case in HUP:129 INT:130 TERM:143; do
+		signal_name="${signal_case%%:*}"
+		expected_status="${signal_case##*:}"
+		record_path="${TEMP_DIR}/${signal_name:l}-temp-path"
+
+		/bin/zsh -c 'source "$1" >/dev/null || exit 99; TEMP_DIR="$2"; OWNED_TEMP_FILES=(); trap '\''handle_process_exit $?'\'' EXIT; trap '\''handle_termination_signal 129'\'' HUP; trap '\''handle_termination_signal 130'\'' INT; trap '\''handle_termination_signal 143'\'' TERM; create_secure_temp_file || exit 98; print -r -- "$JSON_OPTIONS" > "$3"; /bin/kill -s "$4" "$$"; exit 97' appdelete-temp-signal-test "${APPDELETE_SCRIPT}" "${TEMP_DIR}" "${record_path}" "${signal_name}"
+		child_status=$?
+
+		assert_equal "${expected_status}" "${child_status}" "${signal_name} exit status" || return 1
+		assert_exists "${record_path}" || return 1
+		child_temp_path="$(<"${record_path}")"
+		assert_not_exists "${child_temp_path}" || return 1
+	done
+
+	return 0
+}
+
+function test_cleanup_failure_changes_successful_exit_to_failure ()
+{
+	# PURPOSE: Verify a cleanup guardrail failure cannot be reported as successful execution.
+	# PARMS: None
+	# RETURN: 0 when a poisoned target survives and changes an otherwise-zero child status to 1.
+
+	local unexpected_path
+	local child_status
+
+	reset_fixture || return 1
+	unexpected_path="${APPLICATIONS_DIR}/AppDelete.PQRST"
+	: > "${unexpected_path}" || return 1
+
+	/bin/zsh -c 'source "$1" >/dev/null || exit 99; TEMP_DIR="$2"; OWNED_TEMP_FILES=("$3"); JSON_OPTIONS="$3"; trap '\''handle_process_exit $?'\'' EXIT; exit 0' appdelete-temp-cleanup-failure-test "${APPDELETE_SCRIPT}" "${TEMP_DIR}" "${unexpected_path}" 2>/dev/null
+	child_status=$?
+
+	assert_equal "1" "${child_status}" "cleanup-failure exit status" || return 1
+	assert_exists "${unexpected_path}"
 }
 
 function test_valid_json_uses_opaque_ids ()
@@ -1199,6 +1333,11 @@ TEST_ROOT=$(/usr/bin/mktemp -d "/private/tmp/AppDeleteSecurityTests.XXXXXX") || 
 trap cleanup_test_root EXIT HUP INT TERM
 
 run_test test_secure_temp_file_permissions
+run_test test_temp_cleanup_is_constrained_and_idempotent
+run_test test_temp_cleanup_rejects_unexpected_targets
+run_test test_exit_trap_cleans_temp_and_preserves_status
+run_test test_signal_traps_clean_temp_and_preserve_status
+run_test test_cleanup_failure_changes_successful_exit_to_failure
 run_test test_valid_json_uses_opaque_ids
 run_test test_valid_selection_parser
 run_test test_structured_parser_accepts_compact_reordered_json

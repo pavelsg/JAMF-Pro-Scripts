@@ -37,6 +37,8 @@
 #       Preserve a nonzero session result after any requested deletion fails
 # 3.0 - Generate and parse Swift Dialog JSON with Apple's structured jq processor
 #       Enforce a bounded, flat, duplicate-free opaque-ID/Boolean response schema
+# 3.1 - Register and constrain AppDelete-owned temporary files for idempotent cleanup
+#       Preserve process status while cleaning on normal exit, HUP, INT, and TERM
 ######################################################################################################
 #
 # Global "Common" variables
@@ -223,7 +225,7 @@ function create_secure_temp_file ()
 {
 	# PURPOSE: Create the Swift Dialog JSON file without granting local users write access.
 	# PARMS: TEMP_DIR, SCRIPT_NAME
-	# RETURN: 0 when the file is created with mode 0600; otherwise 1.
+	# RETURN: 0 when the file is created with mode 0600 and registered for cleanup; otherwise 1.
 
 	local previous_umask
 	local create_status
@@ -245,17 +247,104 @@ function create_secure_temp_file ()
 		return 1
 	fi
 
+	# Only paths returned by this successful creation boundary become cleanup targets.
+	OWNED_TEMP_FILES+=("${JSON_OPTIONS}")
 	return 0
+}
+
+function is_valid_appdelete_temp_path ()
+{
+	# PURPOSE: Constrain cleanup to an AppDelete mktemp name directly inside TEMP_DIR.
+	# PARMS: $1 - Candidate temporary-file path.
+	# RETURN: 0 when the path has the expected absolute parent and basename; otherwise 1.
+
+	local candidate_path="$1"
+	local expected_directory="${TEMP_DIR%/}"
+	local expected_basename_pattern="${SCRIPT_NAME}."'[[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]]'
+
+	[[ -z "${expected_directory}" ]] && expected_directory="/"
+	[[ -n "${candidate_path}" && "${candidate_path}" == /* ]] || return 1
+	[[ "${candidate_path:h}" == "${expected_directory}" ]] || return 1
+	[[ "${candidate_path:t}" == ${~expected_basename_pattern} ]]
 }
 
 function cleanup_temp_files ()
 {
-	# PURPOSE: Remove AppDelete-owned temporary files on every exit path.
-	# PARMS: JSON_OPTIONS
-	# RETURN: None
+	# PURPOSE: Idempotently remove only regular temporary files owned by AppDelete.
+	# PARMS: JSON_OPTIONS, OWNED_TEMP_FILES, TEMP_DIR, SCRIPT_NAME
+	# RETURN: 0 when every active or registered cleanup target is absent; otherwise 1.
 
-	[[ -n "${JSON_OPTIONS}" && -f "${JSON_OPTIONS}" ]] && /bin/rm -f -- "${JSON_OPTIONS}"
+	local -a cleanup_targets
+	local cleanup_target
+	local cleanup_status=0
+
+	# JSON_OPTIONS closes the interruption window between mktemp returning its path and
+	# that path being added to the ownership registry. Duplicate targets are harmless.
+	cleanup_targets=()
+	[[ -n "${JSON_OPTIONS}" ]] && cleanup_targets+=("${JSON_OPTIONS}")
+	cleanup_targets+=("${OWNED_TEMP_FILES[@]}")
+
+	# Clear live state first so repeated cleanup and re-entrant exit paths are harmless.
+	OWNED_TEMP_FILES=()
 	JSON_OPTIONS=""
+
+	for cleanup_target in "${cleanup_targets[@]}"; do
+		if ! is_valid_appdelete_temp_path "${cleanup_target}"; then
+			print -u2 -- "WARNING: Refusing to clean an unexpected AppDelete temporary path: ${cleanup_target}"
+			cleanup_status=1
+			continue
+		fi
+
+		if [[ -L "${cleanup_target}" ]]; then
+			print -u2 -- "WARNING: Refusing to clean a symbolic-link temporary path: ${cleanup_target}"
+			cleanup_status=1
+			continue
+		fi
+
+		if [[ -e "${cleanup_target}" && ! -f "${cleanup_target}" ]]; then
+			print -u2 -- "WARNING: Refusing to clean a non-regular temporary path: ${cleanup_target}"
+			cleanup_status=1
+			continue
+		fi
+
+		if [[ -f "${cleanup_target}" ]] && ! /bin/rm -f -- "${cleanup_target}"; then
+			print -u2 -- "WARNING: Unable to remove AppDelete temporary file: ${cleanup_target}"
+			cleanup_status=1
+		fi
+	done
+
+	return "${cleanup_status}"
+}
+
+function handle_process_exit ()
+{
+	# PURPOSE: Clean AppDelete-owned temporary files while preserving the process result.
+	# PARMS: $1 - Status that caused the shell to exit.
+	# RETURN: Does not return.
+
+	local original_status="${1:-1}"
+	local cleanup_status
+
+	# Prevent cleanup errors or a second signal from recursively invoking handlers.
+	trap - EXIT HUP INT TERM
+	cleanup_temp_files
+	cleanup_status=$?
+	if (( original_status == 0 && cleanup_status != 0 )); then
+		original_status=1
+	fi
+	exit "${original_status}"
+}
+
+function handle_termination_signal ()
+{
+	# PURPOSE: Convert a catchable termination signal to its conventional shell status.
+	# PARMS: $1 - Conventional 128-plus-signal status.
+	# RETURN: Does not return; the EXIT handler performs cleanup.
+
+	local signal_status="${1:-1}"
+
+	trap - HUP INT TERM
+	exit "${signal_status}"
 }
 
 function create_log_directory ()
@@ -1130,6 +1219,7 @@ function show_completed_prompt ()
 #############################
 
 typeset -ga FILES_LIST
+typeset -ga OWNED_TEMP_FILES
 typeset -ga SELECTED_ITEM_IDS
 typeset -ga CONFIRMED_ITEM_IDS
 typeset -ga SUCCESSFUL_DELETION_IDS
@@ -1150,8 +1240,12 @@ typeset -g DELETION_RESULT_MESSAGE
 
 autoload 'is-at-least'
 
-trap 'cleanup_temp_files' EXIT
-trap 'exit 1' HUP INT TERM
+# zsh scopes traps installed inside functions to that function. Install them here, after the
+# sourced-library return boundary and before temporary state is created.
+trap 'handle_process_exit $?' EXIT
+trap 'handle_termination_signal 129' HUP
+trap 'handle_termination_signal 130' INT
+trap 'handle_termination_signal 143' TERM
 
 create_log_directory
 if ! create_secure_temp_file; then
