@@ -39,6 +39,8 @@
 #       Enforce a bounded, flat, duplicate-free opaque-ID/Boolean response schema
 # 3.1 - Register and constrain AppDelete-owned temporary files for idempotent cleanup
 #       Preserve process status while cleaning on normal exit, HUP, INT, and TERM
+# 3.2 - Replace organization-specific branding defaults with a neutral shared convention
+#       Retain managed BrandingAssetsDirectory and BannerImage overrides
 ######################################################################################################
 #
 # Global "Common" variables
@@ -148,6 +150,8 @@ function initialize_branding_configuration ()
 
 # See if there is a "defaults" file...if so, read in the contents
 DEFAULTS_DIR="/Library/Managed Preferences/com.gianteaglescript.defaults.plist"
+DEFAULT_BRANDING_ASSETS_DIR="/Library/Application Support/JamfProScripts/BrandingAssets"
+DEFAULT_BANNER_IMAGE="SwiftDialog-Banner.png"
 if [[ ${APPDELETE_IS_SOURCED} -eq 0 && -f "$DEFAULTS_DIR" ]]; then
     echo "Found Defaults Files.  Reading in Info"
 	SUPPORT_DIR=$(/usr/bin/defaults read "$DEFAULTS_DIR" SupportFiles 2>/dev/null)
@@ -158,8 +162,8 @@ if [[ ${APPDELETE_IS_SOURCED} -eq 0 && -f "$DEFAULTS_DIR" ]]; then
 	BANNER_TEXT_COLOR=$(/usr/bin/defaults read "$DEFAULTS_DIR" TitleFontColor 2>/dev/null)
 fi
 [[ -z "$SUPPORT_DIR" ]] && SUPPORT_DIR="/Library/Application Support/GiantEagle"
-[[ -z "$BRANDING_ASSETS_DIR" ]] && BRANDING_ASSETS_DIR="${SUPPORT_DIR}"
-[[ -z "$SD_BANNER_IMAGE" ]] && SD_BANNER_IMAGE="GE_SD_BannerImage.png"
+[[ -z "$BRANDING_ASSETS_DIR" ]] && BRANDING_ASSETS_DIR="${DEFAULT_BRANDING_ASSETS_DIR}"
+[[ -z "$SD_BANNER_IMAGE" ]] && SD_BANNER_IMAGE="${DEFAULT_BANNER_IMAGE}"
 [[ -z "$BANNER_TEXT_PADDING" ]] && BANNER_TEXT_PADDING=10 #10 spaces to accommodate for icon offset
 [[ -z "$BANNER_SUBTITLE" ]] && BANNER_SUBTITLE=""
 [[ -z "$BANNER_TEXT_COLOR" ]] && BANNER_TEXT_COLOR="white"

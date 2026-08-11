@@ -31,14 +31,16 @@ AppDelete reads optional settings from `/Library/Managed Preferences/com.giantea
 
 | Key | Default | Contract |
 | --- | --- | --- |
-| `SupportFiles` | `/Library/Application Support/GiantEagle` | Base directory used for AppDelete's `logs` directory and as the branding-directory fallback |
-| `BrandingAssetsDirectory` | The resolved `SupportFiles` value | Absolute local directory from which AppDelete reads branding assets; the directory may be absent until `install_BrandingAssets` runs |
-| `BannerImage` | `GE_SD_BannerImage.png` | JPG, JPEG, PNG, or HEIC filename resolved below `BrandingAssetsDirectory`, or an absolute local path |
+| `SupportFiles` | `/Library/Application Support/GiantEagle` | Legacy base directory used only for AppDelete's `logs` directory |
+| `BrandingAssetsDirectory` | `/Library/Application Support/JamfProScripts/BrandingAssets` | Absolute local directory from which AppDelete reads branding assets; the directory may be absent until `install_BrandingAssets` runs |
+| `BannerImage` | `SwiftDialog-Banner.png` | JPG, JPEG, PNG, or HEIC filename resolved below `BrandingAssetsDirectory`, or an absolute local path |
 | `BannerPadding` | `10` | Swift Dialog banner-title offset |
 | `BannerSubtitle` | Empty | Swift Dialog banner subtitle |
 | `TitleFontColor` | `white` | Swift Dialog banner-title color |
 
-Relative directories, path traversal components, URLs, relative banner subpaths, control characters, and unsupported banner extensions are rejected. This separates branding-asset placement from AppDelete's log directory while retaining the existing `SupportFiles` behavior by default.
+Relative directories, path traversal components, URLs, relative banner subpaths, control characters, and unsupported banner extensions are rejected. Branding-asset placement is independent of AppDelete's legacy log directory. To retain an existing deployment, explicitly set `BrandingAssetsDirectory` and `BannerImage` to the current installed location and filename.
+
+Starting with version 3.2, the unconfigured banner path is `/Library/Application Support/JamfProScripts/BrandingAssets/SwiftDialog-Banner.png`. Update the package or Files and Processes payload behind `install_BrandingAssets` before deployment, or deploy managed overrides for the previous location. AppDelete checks the exact resolved path after the policy finishes and fails closed if the banner is absent or unreadable.
 
 ### Deletion safety
 
@@ -119,3 +121,6 @@ and give them an option to do it again (and again)
 | 3.1 | Registered exact AppDelete-owned temporary files for constrained, idempotent cleanup |
 || Added status-preserving normal-exit, `HUP`, `INT`, and `TERM` lifecycle handlers |
 || Added cleanup ownership, guardrail, idempotence, exit-status, and signal regression coverage |
+| 3.2 | Replaced organization-specific branding defaults with a neutral shared location and filename |
+|| The default banner is now `/Library/Application Support/JamfProScripts/BrandingAssets/SwiftDialog-Banner.png` |
+|| Retained strict `BrandingAssetsDirectory` and `BannerImage` managed overrides and documented migration |

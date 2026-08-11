@@ -129,7 +129,7 @@ Verification command:
 zsh AppDelete/tests/AppDeleteSecurityTests.zsh
 ```
 
-Current full-suite result: `43 passed; 0 failed`.
+Current full-suite result: `44 passed; 0 failed`.
 
 ### AD-002: The protected-application control is unreliable and incorrectly documented
 
@@ -174,7 +174,7 @@ The script does not enforce the protected-app list again at deletion time. It mu
 - Prevented names ending in `.app` from being reintroduced through `ALLOWED_FOLDERS`.
 - Added regression tests for case variants, exact-versus-substring behavior, special characters, duplicate normalized names, invalid configuration, deletion-time enforcement, and folder-list bypasses.
 
-Verification result: `43 passed; 0 failed`.
+Verification result: `44 passed; 0 failed`.
 
 ### AD-003: The script invokes opaque Jamf policies not documented in the README
 
@@ -205,13 +205,14 @@ Repository-wide usage shows that the legacy `install_SymFiles` event is intended
 
 - Documented both privileged custom events, their invocation conditions, expected postconditions, and the requirement to audit their Jamf Pro definitions.
 - Renamed AppDelete's ambiguous `install_SymFiles` event to `install_BrandingAssets`. Existing deployments must rename or recreate the Jamf custom trigger before deploying this version.
-- Added the optional `BrandingAssetsDirectory` managed-preference key. It defaults to `SupportFiles` for compatibility but can independently select the local directory from which branding assets are read.
+- Added the optional `BrandingAssetsDirectory` managed-preference key, which independently selects the local directory from which branding assets are read.
+- Replaced the organization-specific unconfigured asset contract with `/Library/Application Support/JamfProScripts/BrandingAssets/SwiftDialog-Banner.png`. Existing locations remain supported through explicit `BrandingAssetsDirectory` and `BannerImage` values.
 - Resolve a relative `BannerImage` filename to a validated full local path before checking or installing the asset, so a newly installed banner is used during the same execution.
 - Reject relative asset directories, traversal components, URLs, control characters, relative banner subpaths, and unsupported banner formats.
 - Check the Jamf command result and verify the required Swift Dialog or banner postcondition. AppDelete exits nonzero before showing deletion choices if either dependency remains unavailable.
 - Added isolated regression tests for default and custom branding paths, invalid configurations, renamed event arguments, nonzero policy results, and successful policies that fail to install the expected dependency.
 
-Verification result: `43 passed; 0 failed`.
+Verification result: `44 passed; 0 failed`.
 
 The actual `install_SwiftDialog` and `install_BrandingAssets` policy payloads cannot be verified from this repository. Their server-side review remains a release prerequisite rather than a code remediation item.
 
@@ -243,7 +244,7 @@ This can conceal permission failures, immutable files, filesystem errors, or par
 - Preserve a cumulative session-failure flag. Once any requested deletion fails, every later exit path resolves to a nonzero status even if the user retries or cancels afterward.
 - Added deterministic regression tests for partial success, nonzero removal-command status, a misleading zero status with a remaining target, accurate logs/dialog options, whole-batch validation failure, and cumulative process status.
 
-Verification result: `43 passed; 0 failed`.
+Verification result: `44 passed; 0 failed`.
 
 ### AD-005: Hand-built JSON and text parsing mishandle valid application names
 
@@ -276,7 +277,7 @@ The application scan removes `.app` using the regular expression delimiter `.app
 - Added a fail-closed startup probe for `/usr/bin/jq`. This fleet's oldest Mac supplies the Apple binary as part of its operating-system baseline, so AppDelete does not invoke another installation policy.
 - Added regression coverage for exact unusual-label preservation, compact and reordered JSON, malformed input, arrays/scalars, nested and non-Boolean values, multiple JSON documents, partial-state cleanup, oversized responses, duplicate keys, and missing parser behavior.
 
-Verification result: `43 passed; 0 failed`.
+Verification result: `44 passed; 0 failed`.
 
 ### AD-006: Temporary files can survive interrupted execution
 
@@ -305,7 +306,7 @@ The stored information is normally limited to application or folder names, but l
 
 `SIGKILL`, kernel termination, kernel panic, and sudden power loss cannot execute a shell trap. AppDelete therefore cannot promise cleanup for those cases. The remaining exposure is bounded: a residual file has mode `0600`, contains only Swift Dialog configuration, contains no user selection, and has an unpredictable name. Broad startup scavenging was intentionally not added because it could race with a concurrent AppDelete process and would widen the privileged deletion scope.
 
-Verification result: `43 passed; 0 failed`.
+Verification result: `44 passed; 0 failed`.
 
 ## Documented and observed deletion scope
 
@@ -338,7 +339,7 @@ Apart from deletion, the script performs the following actions:
 
 When run by Jamf, standard output may be retained in Jamf policy logs. The script itself contains no direct HTTP client call, but the two `jamf policy` invocations may communicate with Jamf infrastructure and execute server-configured content.
 
-The `SupportFiles` value read from managed preferences remains administrator-controlled and determines the log location. Branding assets can now use an independently validated `BrandingAssetsDirectory`; its value cannot redirect the log directory.
+The `SupportFiles` value read from managed preferences remains administrator-controlled and determines only the legacy log location. Branding assets use an independently validated `BrandingAssetsDirectory`; its value cannot redirect the log directory.
 
 ## Actions not found in the script
 

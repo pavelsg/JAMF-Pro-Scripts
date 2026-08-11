@@ -1118,12 +1118,14 @@ function test_session_exit_status_preserves_prior_failure ()
 
 function test_default_branding_configuration_contract ()
 {
-	# PURPOSE: Verify AppDelete's compatible default asset path and renamed Jamf event.
+	# PURPOSE: Verify AppDelete's neutral default asset path and renamed Jamf event.
 	# PARMS: None
-	# RETURN: 0 when defaults use the support directory and descriptive event name.
+	# RETURN: 0 when defaults are organization-neutral, configurable constants.
 
-	assert_equal "${SUPPORT_DIR}" "${BRANDING_ASSETS_DIR}" "default branding-assets directory" || return 1
-	assert_equal "${SUPPORT_DIR}/GE_SD_BannerImage.png" "${SD_BANNER_IMAGE}" "default banner path" || return 1
+	assert_equal "/Library/Application Support/JamfProScripts/BrandingAssets" "${DEFAULT_BRANDING_ASSETS_DIR}" "default branding-assets constant" || return 1
+	assert_equal "SwiftDialog-Banner.png" "${DEFAULT_BANNER_IMAGE}" "default banner-name constant" || return 1
+	assert_equal "${DEFAULT_BRANDING_ASSETS_DIR}" "${BRANDING_ASSETS_DIR}" "default branding-assets directory" || return 1
+	assert_equal "${DEFAULT_BRANDING_ASSETS_DIR}/${DEFAULT_BANNER_IMAGE}" "${SD_BANNER_IMAGE}" "default banner path" || return 1
 	assert_equal "install_BrandingAssets" "${BRANDING_ASSETS_INSTALL_POLICY}" "branding-assets event"
 }
 
@@ -1138,6 +1140,18 @@ function test_custom_branding_directory_is_resolved ()
 	initialize_branding_configuration || return 1
 	assert_equal "${TEST_ROOT}/Managed Branding" "${BRANDING_ASSETS_DIR}" "normalized branding-assets directory" || return 1
 	assert_equal "${TEST_ROOT}/Managed Branding/Company Banner.PNG" "${SD_BANNER_IMAGE}" "custom banner path"
+}
+
+function test_legacy_branding_location_remains_configurable ()
+{
+	# PURPOSE: Verify existing deployments can retain the former banner contract explicitly.
+	# PARMS: None
+	# RETURN: 0 when managed-equivalent legacy values resolve to the former exact path.
+
+	BRANDING_ASSETS_DIR="${SUPPORT_DIR}"
+	SD_BANNER_IMAGE="GE_SD_BannerImage.png"
+	initialize_branding_configuration || return 1
+	assert_equal "${SUPPORT_DIR}/GE_SD_BannerImage.png" "${SD_BANNER_IMAGE}" "explicit legacy banner path"
 }
 
 function test_absolute_banner_path_is_preserved ()
@@ -1366,6 +1380,7 @@ run_test test_mixed_deletion_results_are_reported_per_item
 run_test test_successful_rm_with_remaining_target_is_failure
 run_test test_session_exit_status_preserves_prior_failure
 run_test test_default_branding_configuration_contract
+run_test test_legacy_branding_location_remains_configurable
 run_test test_custom_branding_directory_is_resolved
 run_test test_absolute_banner_path_is_preserved
 run_test test_invalid_branding_configuration_is_rejected
