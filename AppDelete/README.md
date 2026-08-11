@@ -2,11 +2,27 @@
 
 This script is designed to allow non-admin users the ability to remove applications and folders from the /Applications folder. 
 
-You can control what applications they are not allowed to remove by putting items into the ```MANAGED_APPS``` array.  
+You can control what applications they are not allowed to remove by putting items into the `NOT_ALLOWED_APPS` array.
 
-You can also include folders that are allowed to be deleted, by putting them into the ```ALLOWED_FOLDERS``` array.
+You can also include folders that are allowed to be deleted by putting direct folder names into the `ALLOWED_FOLDERS` array. Paths, `.` and `..` are rejected.
 
 It automatically excludes the preinstalled items that come with the OS _[SIP Protected]_.
+
+### Deletion safety
+
+AppDelete runs as root so non-admin users can remove approved items. The script therefore treats Swift Dialog output as untrusted:
+
+- The dialog configuration is stored in a mode `0600` temporary file.
+- Checkbox labels are assigned opaque IDs; dialog output never becomes a filesystem path.
+- Selected IDs and their exact targets remain in process memory.
+- The same validated selection snapshot is used for confirmation and deletion.
+- Every target is revalidated as an approved, non-symlinked direct child of `/Applications` before any item in the batch is deleted.
+
+Run the security regression suite after changing discovery, selection, or deletion behavior:
+
+```shell
+zsh AppDelete/tests/AppDeleteSecurityTests.zsh
+```
 
 ### Screenshots ###
 Picture of what the end users see when they run it:
@@ -44,3 +60,6 @@ and give them an option to do it again (and again)
 ||       Fixed variable names in the defaults file section
 | 2.5 | Updated SD Version requirements to 3.1.0
 ||       Added ability to set subtitle, color, and padding from defaults file
+| 2.6 | Prevented local selection-file tampering and path traversal |
+|| Selection state is held in memory and represented by opaque dialog IDs |
+|| Added exact target validation, root-only temporary state, cleanup traps, and security regression tests |
