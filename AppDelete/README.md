@@ -8,6 +8,36 @@ You can also include folders that are allowed to be deleted by putting direct fo
 
 It automatically excludes the preinstalled items that come with the OS _[SIP Protected]_.
 
+### Runtime prerequisites and Jamf policies
+
+AppDelete depends on Swift Dialog and on one local branding banner. It may invoke the following administrator-defined Jamf Pro custom events as root before showing any deletion choices:
+
+| Custom event | Invoked when | Required postcondition |
+| --- | --- | --- |
+| `install_SwiftDialog` | `/usr/local/bin/dialog` is missing, not executable, or older than `3.1.0` | `/usr/local/bin/dialog` is executable and reports version `3.1.0` or newer |
+| `install_BrandingAssets` | The configured banner is missing or unreadable | The configured banner exists as a readable local file |
+
+The policy definitions and payloads are stored in Jamf Pro, not in this repository. Review each policy's packages, scripts, Files and Processes payload, maintenance actions, scope, and network behavior before deployment. A custom event can execute arbitrary administrator-configured actions with root privileges; the names above do not constrain its behavior.
+
+AppDelete checks the command result and required local postcondition after invoking either event. If installation fails, the expected file remains unavailable, or Swift Dialog is still below the required version, AppDelete exits nonzero before presenting the deletion interface.
+
+Deployments upgrading from version 2.7 or earlier must rename or recreate the legacy `install_SymFiles` Jamf custom trigger as `install_BrandingAssets`. AppDelete no longer invokes the legacy name.
+
+### Managed branding configuration
+
+AppDelete reads optional settings from `/Library/Managed Preferences/com.gianteaglescript.defaults.plist`:
+
+| Key | Default | Contract |
+| --- | --- | --- |
+| `SupportFiles` | `/Library/Application Support/GiantEagle` | Base directory used for AppDelete's `logs` directory and as the branding-directory fallback |
+| `BrandingAssetsDirectory` | The resolved `SupportFiles` value | Absolute local directory from which AppDelete reads branding assets; the directory may be absent until `install_BrandingAssets` runs |
+| `BannerImage` | `GE_SD_BannerImage.png` | JPG, JPEG, PNG, or HEIC filename resolved below `BrandingAssetsDirectory`, or an absolute local path |
+| `BannerPadding` | `10` | Swift Dialog banner-title offset |
+| `BannerSubtitle` | Empty | Swift Dialog banner subtitle |
+| `TitleFontColor` | `white` | Swift Dialog banner-title color |
+
+Relative directories, path traversal components, URLs, relative banner subpaths, control characters, and unsupported banner extensions are rejected. This separates branding-asset placement from AppDelete's log directory while retaining the existing `SupportFiles` behavior by default.
+
 ### Deletion safety
 
 AppDelete runs as root so non-admin users can remove approved items. The script therefore treats Swift Dialog output as untrusted:
@@ -67,3 +97,6 @@ and give them an option to do it again (and again)
 | 2.7 | Replaced protected-app substring removal with validated, case-insensitive exact matching |
 || Added fail-closed policy initialization and deletion-time protection checks |
 || Prevented application bundles from bypassing protection through `ALLOWED_FOLDERS` |
+| 2.8 | Documented privileged Jamf policy dependencies and made dependency checks fail closed |
+|| Renamed `install_SymFiles` to `install_BrandingAssets` for AppDelete |
+|| Added configurable `BrandingAssetsDirectory` managed preference and strict local-path validation |

@@ -10,7 +10,7 @@
 
 ### Remediation update
 
-AD-001 was remediated in the current uncommitted working tree on 2026-08-11. The original finding below describes commit `43b3561`; the added "Remediation implemented" section records the replacement security boundary and verification results. Other audit findings remain independently applicable unless explicitly noted.
+AD-001 and AD-002 were remediated after the original audit. AD-003 repository-side remediation was implemented in the current working tree on 2026-08-11. The original findings below describe commit `43b3561`; each "Remediation implemented" section records the replacement behavior and verification results. Jamf Pro policy definitions remain outside the repository and require deployment-specific review.
 
 ## Executive summary
 
@@ -129,7 +129,7 @@ Verification command:
 zsh AppDelete/tests/AppDeleteSecurityTests.zsh
 ```
 
-Current full-suite result: `20 passed; 0 failed`.
+Current full-suite result: `30 passed; 0 failed`.
 
 ### AD-002: The protected-application control is unreliable and incorrectly documented
 
@@ -174,15 +174,15 @@ The script does not enforce the protected-app list again at deletion time. It mu
 - Prevented names ending in `.app` from being reintroduced through `ALLOWED_FOLDERS`.
 - Added regression tests for case variants, exact-versus-substring behavior, special characters, duplicate normalized names, invalid configuration, deletion-time enforcement, and folder-list bypasses.
 
-Verification result: `20 passed; 0 failed`.
+Verification result: `30 passed; 0 failed`.
 
 ### AD-003: The script invokes opaque Jamf policies not documented in the README
 
 - Severity: Operational/security dependency
-- Status: Requires separate Jamf server review
-- Affected lines: 98-99, 162-197
+- Status: Repository-side remediation implemented; Jamf server definitions must be verified before deployment
+- Affected lines in the remediated script: 92-182, 285-370, 961-968
 
-The script invokes these custom Jamf policy events:
+The audited script invoked these custom Jamf policy events:
 
 ```text
 install_SwiftDialog
@@ -193,11 +193,27 @@ install_SymFiles
 
 These events are not defined in this repository. The script names suggest installation behavior, but a Jamf custom event executes whatever actions are associated with it on the Jamf server. Those actions can include package installation, downloads, scripts, inventory changes, and other privileged operations.
 
+Repository-wide usage shows that the legacy `install_SymFiles` event is intended to install shared Swift Dialog graphical assets, including the configured banner. It is an internal Jamf custom-event name rather than a third-party application dependency. This establishes the caller's intent but cannot establish the actual Jamf server-side payload.
+
 #### Required remediation
 
 - Audit both event definitions in Jamf Pro, including packages, scripts, files and processes, maintenance actions, and policy scope.
 - Document these prerequisites and side effects in `AppDelete/README.md`.
 - Fail closed with a clear error if a dependency installation fails.
+
+#### Remediation implemented
+
+- Documented both privileged custom events, their invocation conditions, expected postconditions, and the requirement to audit their Jamf Pro definitions.
+- Renamed AppDelete's ambiguous `install_SymFiles` event to `install_BrandingAssets`. Existing deployments must rename or recreate the Jamf custom trigger before deploying this version.
+- Added the optional `BrandingAssetsDirectory` managed-preference key. It defaults to `SupportFiles` for compatibility but can independently select the local directory from which branding assets are read.
+- Resolve a relative `BannerImage` filename to a validated full local path before checking or installing the asset, so a newly installed banner is used during the same execution.
+- Reject relative asset directories, traversal components, URLs, control characters, relative banner subpaths, and unsupported banner formats.
+- Check the Jamf command result and verify the required Swift Dialog or banner postcondition. AppDelete exits nonzero before showing deletion choices if either dependency remains unavailable.
+- Added isolated regression tests for default and custom branding paths, invalid configurations, renamed event arguments, nonzero policy results, and successful policies that fail to install the expected dependency.
+
+Verification result: `30 passed; 0 failed`.
+
+The actual `install_SwiftDialog` and `install_BrandingAssets` policy payloads cannot be verified from this repository. Their server-side review remains a release prerequisite rather than a code remediation item.
 
 ### AD-004: Deletion failures are logged and displayed as successes
 
@@ -280,11 +296,11 @@ Apart from deletion, the script performs the following actions:
 | Creates or modifies a log directory and file | Normally `/Library/Application Support/GiantEagle/logs/AppDelete.log` | Not disclosed |
 | Changes log permissions | Directory `0755`; file `0644` | Not disclosed |
 | Logs dependency status and removed names | Local log and standard output | Not disclosed |
-| Invokes Jamf policy events | `install_SwiftDialog` and `install_SymFiles` | Not disclosed |
+| Invokes Jamf policy events | `install_SwiftDialog` and, when the banner is absent, `install_BrandingAssets` | Documented in the remediated README |
 
 When run by Jamf, standard output may be retained in Jamf policy logs. The script itself contains no direct HTTP client call, but the two `jamf policy` invocations may communicate with Jamf infrastructure and execute server-configured content.
 
-The `SupportFiles` value read from managed preferences is trusted without validation and controls the log location. Because managed preferences should be administrator-controlled, this is primarily a configuration trust boundary rather than a low-privilege exploit. It should nevertheless be validated and documented.
+The `SupportFiles` value read from managed preferences remains administrator-controlled and determines the log location. Branding assets can now use an independently validated `BrandingAssetsDirectory`; its value cannot redirect the log directory.
 
 ## Actions not found in the script
 

@@ -31,6 +31,8 @@
 #       Validate opaque dialog item IDs against exact /Applications targets before deletion
 # 2.7 - Enforce protected applications through a validated, case-normalized exact-match policy
 #       Recheck protection immediately before deletion and prevent ALLOWED_FOLDERS app bypasses
+# 2.8 - Document and fail closed on external Jamf policy dependencies
+#       Rename the branding-assets event and make its local asset directory configurable
 ######################################################################################################
 #
 # Global "Common" variables
@@ -87,23 +89,80 @@ JSON_OPTIONS=""
 #
 ###################################################
 
+function initialize_branding_configuration ()
+{
+	# PURPOSE: Validate the branding directory and resolve the configured banner to a local path.
+	# PARMS: BRANDING_ASSETS_DIR, SD_BANNER_IMAGE
+	# RETURN: 0 with normalized configuration; otherwise 1.
+
+	local configured_directory="${BRANDING_ASSETS_DIR}"
+	local configured_image="${SD_BANNER_IMAGE}"
+	local path_with_boundaries
+
+	if [[ -z "${configured_directory}" || "${configured_directory}" != /* ||
+		  "${configured_directory}" == *[[:cntrl:]]* ]]; then
+		return 1
+	fi
+
+	while [[ "${configured_directory}" != "/" && "${configured_directory}" == */ ]]; do
+		configured_directory="${configured_directory%/}"
+	done
+
+	path_with_boundaries="/${configured_directory#/}/"
+	if [[ "${path_with_boundaries}" == *'/../'* || "${path_with_boundaries}" == *'/./'* ||
+		  "${path_with_boundaries}" == *'//'* ]]; then
+		return 1
+	fi
+
+	if [[ -z "${configured_image}" || "${configured_image}" == *[[:cntrl:]]* ]]; then
+		return 1
+	fi
+
+	if [[ "${configured_image}" == /* ]]; then
+		path_with_boundaries="/${configured_image#/}/"
+		if [[ "${path_with_boundaries}" == *'/../'* || "${path_with_boundaries}" == *'/./'* ||
+			  "${path_with_boundaries}" == *'//'* ]]; then
+			return 1
+		fi
+	else
+		# Relative banner values are filenames, not paths; the directory has its own setting.
+		[[ "${configured_image}" == */* || "${configured_image}" == "." || "${configured_image}" == ".." ]] && return 1
+		configured_image="${configured_directory%/}/${configured_image}"
+	fi
+
+	case "${configured_image:l}" in
+		*.jpg | *.jpeg | *.png | *.heic ) ;;
+		* ) return 1 ;;
+	esac
+
+	BRANDING_ASSETS_DIR="${configured_directory}"
+	SD_BANNER_IMAGE="${configured_image}"
+	return 0
+}
+
 # See if there is a "defaults" file...if so, read in the contents
 DEFAULTS_DIR="/Library/Managed Preferences/com.gianteaglescript.defaults.plist"
 if [[ ${APPDELETE_IS_SOURCED} -eq 0 && -f "$DEFAULTS_DIR" ]]; then
     echo "Found Defaults Files.  Reading in Info"
-    SUPPORT_DIR=$(defaults read "$DEFAULTS_DIR" SupportFiles)
-    SD_BANNER_IMAGE=$(defaults read "$DEFAULTS_DIR" BannerImage)
-    BANNER_TEXT_PADDING=$(defaults read "$DEFAULTS_DIR" BannerPadding)
-    BANNER_SUBTITLE=$(defaults read "$DEFAULTS_DIR" BannerSubtitle)
-    BANNER_TEXT_COLOR=$(defaults read "$DEFAULTS_DIR" TitleFontColor)
-else
-    SUPPORT_DIR="/Library/Application Support/GiantEagle"
-    SD_BANNER_IMAGE="GE_SD_BannerImage.png"
-    BANNER_TEXT_PADDING=10 #10 spaces to accommodate for icon offset
-    BANNER_SUBTITLE=""
+	SUPPORT_DIR=$(/usr/bin/defaults read "$DEFAULTS_DIR" SupportFiles 2>/dev/null)
+	BRANDING_ASSETS_DIR=$(/usr/bin/defaults read "$DEFAULTS_DIR" BrandingAssetsDirectory 2>/dev/null)
+	SD_BANNER_IMAGE=$(/usr/bin/defaults read "$DEFAULTS_DIR" BannerImage 2>/dev/null)
+	BANNER_TEXT_PADDING=$(/usr/bin/defaults read "$DEFAULTS_DIR" BannerPadding 2>/dev/null)
+	BANNER_SUBTITLE=$(/usr/bin/defaults read "$DEFAULTS_DIR" BannerSubtitle 2>/dev/null)
+	BANNER_TEXT_COLOR=$(/usr/bin/defaults read "$DEFAULTS_DIR" TitleFontColor 2>/dev/null)
 fi
-[[ -e $SUPPORT_DIR/$SD_BANNER_IMAGE ]] && SD_BANNER_IMAGE="$SUPPORT_DIR/$SD_BANNER_IMAGE"
+[[ -z "$SUPPORT_DIR" ]] && SUPPORT_DIR="/Library/Application Support/GiantEagle"
+[[ -z "$BRANDING_ASSETS_DIR" ]] && BRANDING_ASSETS_DIR="${SUPPORT_DIR}"
+[[ -z "$SD_BANNER_IMAGE" ]] && SD_BANNER_IMAGE="GE_SD_BannerImage.png"
+[[ -z "$BANNER_TEXT_PADDING" ]] && BANNER_TEXT_PADDING=10 #10 spaces to accommodate for icon offset
+[[ -z "$BANNER_SUBTITLE" ]] && BANNER_SUBTITLE=""
 [[ -z "$BANNER_TEXT_COLOR" ]] && BANNER_TEXT_COLOR="white"
+
+if ! initialize_branding_configuration; then
+	print -u2 -- "ERROR: BrandingAssetsDirectory must be an absolute local directory and BannerImage must be a local JPG, JPEG, PNG, or HEIC filename/path."
+	[[ ${APPDELETE_IS_SOURCED} -eq 1 ]] && return 1
+	exit 1
+fi
 
 # Log files location
 
@@ -115,9 +174,10 @@ SD_WINDOW_TITLE="Delete Applications"
 OVERLAY_ICON="/System/Applications/App Store.app"
 SD_ICON_FILE="SF=trash.fill, color=black, weight=light"
 
-# Trigger installs for Images & icons
+# Jamf custom events used to install runtime dependencies
 
-SUPPORT_FILE_INSTALL_POLICY="install_SymFiles"
+JAMF_BINARY="/usr/local/bin/jamf"
+BRANDING_ASSETS_INSTALL_POLICY="install_BrandingAssets"
 DIALOG_INSTALL_POLICY="install_SwiftDialog"
 
 # Exact application names in this array are protected with case-insensitive, literal matching.
@@ -223,39 +283,90 @@ function logMe ()
 
 function check_swift_dialog_install ()
 {
-    # Check to make sure that Swift Dialog is installed and functioning correctly
-    # Will install process if missing or corrupted
-    #
-    # RETURN: None
+	# PURPOSE: Ensure Swift Dialog exists and satisfies the configured minimum version.
+	# PARMS: SW_DIALOG, SD_VERSION, MIN_SD_REQUIRED_VERSION
+	# RETURN: 0 when the dependency is ready; otherwise 1.
 
-    logMe "Ensuring that swiftDialog version is installed..."
-    if [[ ! -x "${SW_DIALOG}" ]]; then
-        logMe "Swift Dialog is missing or corrupted - Installing from JAMF"
-        install_swift_dialog
-        SD_VERSION=$( ${SW_DIALOG} --version)        
-    fi
+	local installation_reason=""
 
-    if ! is-at-least "${MIN_SD_REQUIRED_VERSION}" "${SD_VERSION}"; then
-        logMe "Swift Dialog is outdated - Installing version '${MIN_SD_REQUIRED_VERSION}' from JAMF..."
-        install_swift_dialog
-    else    
-        logMe "Swift Dialog is currently running: ${SD_VERSION}"
-    fi
+	logMe "Ensuring that Swift Dialog is installed..."
+	if [[ ! -x "${SW_DIALOG}" ]]; then
+		installation_reason="missing or not executable"
+	elif ! is-at-least "${MIN_SD_REQUIRED_VERSION}" "${SD_VERSION}"; then
+		installation_reason="older than required version ${MIN_SD_REQUIRED_VERSION}"
+	fi
+
+	if [[ -n "${installation_reason}" ]]; then
+		logMe "Swift Dialog is ${installation_reason}; invoking Jamf event '${DIALOG_INSTALL_POLICY}'."
+		install_swift_dialog || return 1
+	fi
+
+	if [[ ! -x "${SW_DIALOG}" ]]; then
+		logMe "ERROR: Swift Dialog is unavailable after Jamf event '${DIALOG_INSTALL_POLICY}'."
+		return 1
+	fi
+
+	SD_VERSION=$("${SW_DIALOG}" --version 2>/dev/null) || {
+		logMe "ERROR: Unable to determine the installed Swift Dialog version."
+		return 1
+	}
+
+	if ! is-at-least "${MIN_SD_REQUIRED_VERSION}" "${SD_VERSION}"; then
+		logMe "ERROR: Swift Dialog ${SD_VERSION} does not satisfy required version ${MIN_SD_REQUIRED_VERSION}."
+		return 1
+	fi
+
+	logMe "Swift Dialog is ready: ${SD_VERSION}"
+	return 0
 }
 
 function install_swift_dialog ()
 {
-    # Install Swift dialog From JAMF
-    # PARMS Expected: DIALOG_INSTALL_POLICY - policy trigger from JAMF
-    #
-    # RETURN: None
+	# PURPOSE: Invoke the administrator-defined Jamf policy that installs Swift Dialog.
+	# PARMS: JAMF_BINARY, DIALOG_INSTALL_POLICY
+	# RETURN: The Jamf policy command status.
 
-	/usr/local/bin/jamf policy -event ${DIALOG_INSTALL_POLICY}
+	if [[ ! -x "${JAMF_BINARY}" ]]; then
+		logMe "ERROR: Jamf binary is unavailable at ${JAMF_BINARY}."
+		return 1
+	fi
+
+	if ! "${JAMF_BINARY}" policy -event "${DIALOG_INSTALL_POLICY}"; then
+		logMe "ERROR: Jamf event '${DIALOG_INSTALL_POLICY}' failed."
+		return 1
+	fi
+
+	return 0
 }
 
-function check_support_files ()
+function check_branding_assets ()
 {
-    [[ ! -e "${SD_BANNER_IMAGE}" ]] && [[ "${SD_BANNER_IMAGE}" =~ \.(jpg|png|heic)$ ]] && /usr/local/bin/jamf policy -event ${SUPPORT_FILE_INSTALL_POLICY}
+	# PURPOSE: Ensure the configured local banner exists, installing branding assets when needed.
+	# PARMS: SD_BANNER_IMAGE, JAMF_BINARY, BRANDING_ASSETS_INSTALL_POLICY
+	# RETURN: 0 when the banner is a readable file; otherwise 1.
+
+	if [[ -f "${SD_BANNER_IMAGE}" && -r "${SD_BANNER_IMAGE}" ]]; then
+		return 0
+	fi
+
+	if [[ ! -x "${JAMF_BINARY}" ]]; then
+		logMe "ERROR: Jamf binary is unavailable at ${JAMF_BINARY}; cannot install branding assets."
+		return 1
+	fi
+
+	logMe "Branding banner is missing; invoking Jamf event '${BRANDING_ASSETS_INSTALL_POLICY}'."
+	if ! "${JAMF_BINARY}" policy -event "${BRANDING_ASSETS_INSTALL_POLICY}"; then
+		logMe "ERROR: Jamf event '${BRANDING_ASSETS_INSTALL_POLICY}' failed."
+		return 1
+	fi
+
+	if [[ ! -f "${SD_BANNER_IMAGE}" || ! -r "${SD_BANNER_IMAGE}" ]]; then
+		logMe "ERROR: Branding banner is still unavailable after '${BRANDING_ASSETS_INSTALL_POLICY}': ${SD_BANNER_IMAGE}"
+		return 1
+	fi
+
+	logMe "Branding banner is ready: ${SD_BANNER_IMAGE}"
+	return 0
 }
 
 function cleanup_and_exit ()
@@ -846,8 +957,14 @@ if ! create_secure_temp_file; then
 	cleanup_and_exit 1
 fi
 
-check_swift_dialog_install
-check_support_files
+if ! check_swift_dialog_install; then
+	logMe "ERROR: AppDelete cannot continue without a verified Swift Dialog installation."
+	cleanup_and_exit 1
+fi
+if ! check_branding_assets; then
+	logMe "ERROR: AppDelete cannot continue without the configured branding banner."
+	cleanup_and_exit 1
+fi
 create_infobox_message
 
 while true; do

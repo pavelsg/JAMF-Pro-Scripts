@@ -175,6 +175,30 @@ function create_test_folder ()
 	: > "${folder_path}/Nested/content.txt"
 }
 
+function create_mock_jamf_binary ()
+{
+	# PURPOSE: Create an isolated Jamf command double for dependency-policy tests.
+	# PARMS: $1 - Mock binary path.
+	# RETURN: 0 when the executable mock is ready; otherwise 1.
+
+	local mock_path="$1"
+
+	print -r -- '#!/bin/zsh' > "${mock_path}" || return 1
+	print -r -- 'print -r -- "$*" > "${APPDELETE_TEST_JAMF_ARGS}"' >> "${mock_path}" || return 1
+	print -r -- 'if [[ "${APPDELETE_TEST_INSTALL_BANNER:-0}" == "1" ]]; then' >> "${mock_path}" || return 1
+	print -r -- '    /bin/mkdir -p "${APPDELETE_TEST_BANNER:h}" || exit 90' >> "${mock_path}" || return 1
+	print -r -- '    : > "${APPDELETE_TEST_BANNER}" || exit 91' >> "${mock_path}" || return 1
+	print -r -- 'fi' >> "${mock_path}" || return 1
+	print -r -- 'if [[ "${APPDELETE_TEST_INSTALL_DIALOG:-0}" == "1" ]]; then' >> "${mock_path}" || return 1
+	print -r -- '    /bin/mkdir -p "${APPDELETE_TEST_DIALOG:h}" || exit 92' >> "${mock_path}" || return 1
+	print -r -- '    print -r -- "#!/bin/zsh" > "${APPDELETE_TEST_DIALOG}" || exit 93' >> "${mock_path}" || return 1
+	print -r -- '    print -r -- '\''print -r -- "${APPDELETE_TEST_DIALOG_VERSION:-3.1.0}"'\'' >> "${APPDELETE_TEST_DIALOG}" || exit 94' >> "${mock_path}" || return 1
+	print -r -- '    /bin/chmod 700 "${APPDELETE_TEST_DIALOG}" || exit 95' >> "${mock_path}" || return 1
+	print -r -- 'fi' >> "${mock_path}" || return 1
+	print -r -- 'exit "${APPDELETE_TEST_JAMF_EXIT:-0}"' >> "${mock_path}" || return 1
+	/bin/chmod 700 "${mock_path}"
+}
+
 function prepare_dialog_configuration ()
 {
 	# PURPOSE: Build candidates and a secure dialog configuration for the current fixture.
@@ -652,10 +676,204 @@ function test_valid_allowed_folder_deletion ()
 	assert_not_exists "${folder_path}"
 }
 
+function test_default_branding_configuration_contract ()
+{
+	# PURPOSE: Verify AppDelete's compatible default asset path and renamed Jamf event.
+	# PARMS: None
+	# RETURN: 0 when defaults use the support directory and descriptive event name.
+
+	assert_equal "${SUPPORT_DIR}" "${BRANDING_ASSETS_DIR}" "default branding-assets directory" || return 1
+	assert_equal "${SUPPORT_DIR}/GE_SD_BannerImage.png" "${SD_BANNER_IMAGE}" "default banner path" || return 1
+	assert_equal "install_BrandingAssets" "${BRANDING_ASSETS_INSTALL_POLICY}" "branding-assets event"
+}
+
+function test_custom_branding_directory_is_resolved ()
+{
+	# PURPOSE: Verify a configured asset filename is resolved against its independent directory.
+	# PARMS: None
+	# RETURN: 0 when the normalized full path uses BRANDING_ASSETS_DIR.
+
+	BRANDING_ASSETS_DIR="${TEST_ROOT}/Managed Branding/"
+	SD_BANNER_IMAGE="Company Banner.PNG"
+	initialize_branding_configuration || return 1
+	assert_equal "${TEST_ROOT}/Managed Branding" "${BRANDING_ASSETS_DIR}" "normalized branding-assets directory" || return 1
+	assert_equal "${TEST_ROOT}/Managed Branding/Company Banner.PNG" "${SD_BANNER_IMAGE}" "custom banner path"
+}
+
+function test_absolute_banner_path_is_preserved ()
+{
+	# PURPOSE: Verify an explicitly configured absolute local banner path is not rebased.
+	# PARMS: None
+	# RETURN: 0 when the absolute banner path remains unchanged.
+
+	local absolute_banner="${TEST_ROOT}/Independent/Banner.heic"
+
+	BRANDING_ASSETS_DIR="${TEST_ROOT}/Managed Branding"
+	SD_BANNER_IMAGE="${absolute_banner}"
+	initialize_branding_configuration || return 1
+	assert_equal "${absolute_banner}" "${SD_BANNER_IMAGE}" "absolute banner path"
+}
+
+function test_invalid_branding_configuration_is_rejected ()
+{
+	# PURPOSE: Verify ambiguous or traversing branding paths fail validation.
+	# PARMS: None
+	# RETURN: 0 when all unsafe configuration variants are rejected.
+
+	BRANDING_ASSETS_DIR="relative/assets"
+	SD_BANNER_IMAGE="Banner.png"
+	assert_failure initialize_branding_configuration || return 1
+
+	BRANDING_ASSETS_DIR="${TEST_ROOT}/Branding/../Elsewhere"
+	SD_BANNER_IMAGE="Banner.png"
+	assert_failure initialize_branding_configuration || return 1
+
+	BRANDING_ASSETS_DIR="${TEST_ROOT}/Branding"
+	SD_BANNER_IMAGE="../Banner.png"
+	assert_failure initialize_branding_configuration || return 1
+
+	BRANDING_ASSETS_DIR="${TEST_ROOT}/Branding"
+	SD_BANNER_IMAGE="Banner.txt"
+	assert_failure initialize_branding_configuration || return 1
+
+	BRANDING_ASSETS_DIR="${TEST_ROOT}/Branding"
+	SD_BANNER_IMAGE=$'Banner\tName.png'
+	assert_failure initialize_branding_configuration
+}
+
+function test_existing_banner_skips_jamf_policy ()
+{
+	# PURPOSE: Verify an already-readable banner does not trigger an external Jamf policy.
+	# PARMS: None
+	# RETURN: 0 when the existing asset is accepted without a Jamf binary.
+
+	SD_BANNER_IMAGE="${TEST_ROOT}/Existing/Banner.png"
+	/bin/mkdir -p "${SD_BANNER_IMAGE:h}" || return 1
+	: > "${SD_BANNER_IMAGE}" || return 1
+	JAMF_BINARY="${TEST_ROOT}/does-not-exist"
+	assert_success check_branding_assets
+}
+
+function test_missing_banner_invokes_renamed_policy ()
+{
+	# PURPOSE: Verify a successful branding event must produce the configured local banner.
+	# PARMS: None
+	# RETURN: 0 when the renamed event is invoked and its installed banner is accepted.
+
+	local mock_jamf="${TEST_ROOT}/mock-jamf-success"
+	local argument_log="${TEST_ROOT}/mock-jamf-success.args"
+
+	create_mock_jamf_binary "${mock_jamf}" || return 1
+	JAMF_BINARY="${mock_jamf}"
+	BRANDING_ASSETS_INSTALL_POLICY="install_BrandingAssets"
+	SD_BANNER_IMAGE="${TEST_ROOT}/Branding/Banner.png"
+	export APPDELETE_TEST_JAMF_ARGS="${argument_log}"
+	export APPDELETE_TEST_INSTALL_BANNER=1
+	export APPDELETE_TEST_BANNER="${SD_BANNER_IMAGE}"
+	export APPDELETE_TEST_JAMF_EXIT=0
+
+	check_branding_assets || return 1
+	assert_exists "${SD_BANNER_IMAGE}" || return 1
+	assert_equal "policy -event install_BrandingAssets" "$(<"${argument_log}")" "Jamf branding event arguments"
+}
+
+function test_branding_policy_failure_is_fail_closed ()
+{
+	# PURPOSE: Verify a failed Jamf branding policy prevents dependency readiness.
+	# PARMS: None
+	# RETURN: 0 when a nonzero Jamf status is propagated.
+
+	local mock_jamf="${TEST_ROOT}/mock-jamf-failure"
+
+	create_mock_jamf_binary "${mock_jamf}" || return 1
+	JAMF_BINARY="${mock_jamf}"
+	BRANDING_ASSETS_INSTALL_POLICY="install_BrandingAssets"
+	SD_BANNER_IMAGE="${TEST_ROOT}/Missing/Banner.png"
+	export APPDELETE_TEST_JAMF_ARGS="${TEST_ROOT}/mock-jamf-failure.args"
+	export APPDELETE_TEST_INSTALL_BANNER=0
+	export APPDELETE_TEST_BANNER="${SD_BANNER_IMAGE}"
+	export APPDELETE_TEST_JAMF_EXIT=12
+
+	assert_failure check_branding_assets || return 1
+	assert_not_exists "${SD_BANNER_IMAGE}"
+}
+
+function test_branding_policy_requires_banner_postcondition ()
+{
+	# PURPOSE: Verify a zero Jamf status is insufficient when the expected asset remains absent.
+	# PARMS: None
+	# RETURN: 0 when the missing postcondition causes a failure.
+
+	local mock_jamf="${TEST_ROOT}/mock-jamf-no-asset"
+
+	create_mock_jamf_binary "${mock_jamf}" || return 1
+	JAMF_BINARY="${mock_jamf}"
+	BRANDING_ASSETS_INSTALL_POLICY="install_BrandingAssets"
+	SD_BANNER_IMAGE="${TEST_ROOT}/StillMissing/Banner.png"
+	export APPDELETE_TEST_JAMF_ARGS="${TEST_ROOT}/mock-jamf-no-asset.args"
+	export APPDELETE_TEST_INSTALL_BANNER=0
+	export APPDELETE_TEST_BANNER="${SD_BANNER_IMAGE}"
+	export APPDELETE_TEST_JAMF_EXIT=0
+
+	assert_failure check_branding_assets || return 1
+	assert_not_exists "${SD_BANNER_IMAGE}"
+}
+
+function test_swift_dialog_policy_failure_is_fail_closed ()
+{
+	# PURPOSE: Verify a failed Swift Dialog Jamf event prevents dependency readiness.
+	# PARMS: None
+	# RETURN: 0 when the nonzero Jamf status is propagated and no binary appears.
+
+	local mock_jamf="${TEST_ROOT}/mock-jamf-dialog-failure"
+
+	create_mock_jamf_binary "${mock_jamf}" || return 1
+	JAMF_BINARY="${mock_jamf}"
+	DIALOG_INSTALL_POLICY="install_SwiftDialog"
+	SW_DIALOG="${TEST_ROOT}/Missing/dialog"
+	SD_VERSION="0.0.0"
+	export APPDELETE_TEST_JAMF_ARGS="${TEST_ROOT}/mock-jamf-dialog-failure.args"
+	export APPDELETE_TEST_INSTALL_BANNER=0
+	export APPDELETE_TEST_INSTALL_DIALOG=0
+	export APPDELETE_TEST_DIALOG="${SW_DIALOG}"
+	export APPDELETE_TEST_JAMF_EXIT=14
+
+	assert_failure check_swift_dialog_install || return 1
+	assert_not_exists "${SW_DIALOG}"
+}
+
+function test_swift_dialog_policy_requires_verified_postcondition ()
+{
+	# PURPOSE: Verify a successful event must install an executable, sufficiently new dialog binary.
+	# PARMS: None
+	# RETURN: 0 when installation and version postconditions are enforced.
+
+	local mock_jamf="${TEST_ROOT}/mock-jamf-dialog-success"
+	local argument_log="${TEST_ROOT}/mock-jamf-dialog-success.args"
+
+	create_mock_jamf_binary "${mock_jamf}" || return 1
+	JAMF_BINARY="${mock_jamf}"
+	DIALOG_INSTALL_POLICY="install_SwiftDialog"
+	SW_DIALOG="${TEST_ROOT}/Installed/dialog"
+	SD_VERSION="0.0.0"
+	export APPDELETE_TEST_JAMF_ARGS="${argument_log}"
+	export APPDELETE_TEST_INSTALL_BANNER=0
+	export APPDELETE_TEST_INSTALL_DIALOG=1
+	export APPDELETE_TEST_DIALOG="${SW_DIALOG}"
+	export APPDELETE_TEST_DIALOG_VERSION="3.2.0"
+	export APPDELETE_TEST_JAMF_EXIT=0
+
+	check_swift_dialog_install || return 1
+	[[ -x "${SW_DIALOG}" ]] || fail "Expected an executable Swift Dialog test binary" || return 1
+	assert_equal "3.2.0" "${SD_VERSION}" "installed Swift Dialog version" || return 1
+	assert_equal "policy -event install_SwiftDialog" "$(<"${argument_log}")" "Jamf Swift Dialog event arguments"
+}
+
 source "${APPDELETE_SCRIPT}" >/dev/null || {
 	print -u2 -- "Unable to load ${APPDELETE_SCRIPT}"
 	exit 1
 }
+autoload 'is-at-least'
 
 # Keep expected security failures quiet while preserving messages for assertions/debugging.
 function logMe ()
@@ -694,6 +912,16 @@ run_test test_confirmation_snapshot_ignores_legacy_selection_file
 run_test test_tampered_target_map_fails_before_any_deletion
 run_test test_target_replaced_by_symlink_is_rejected
 run_test test_valid_allowed_folder_deletion
+run_test test_default_branding_configuration_contract
+run_test test_custom_branding_directory_is_resolved
+run_test test_absolute_banner_path_is_preserved
+run_test test_invalid_branding_configuration_is_rejected
+run_test test_existing_banner_skips_jamf_policy
+run_test test_missing_banner_invokes_renamed_policy
+run_test test_branding_policy_failure_is_fail_closed
+run_test test_branding_policy_requires_banner_postcondition
+run_test test_swift_dialog_policy_failure_is_fail_closed
+run_test test_swift_dialog_policy_requires_verified_postcondition
 
 print -- ""
 print -- "${TESTS_PASSED} passed; ${TESTS_FAILED} failed"
