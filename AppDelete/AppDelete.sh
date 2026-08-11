@@ -29,6 +29,8 @@
 # 2.6 - Secured the deletion boundary against local selection-file tampering and path traversal
 #       Keep dialog configuration root-only and hold selections in process memory
 #       Validate opaque dialog item IDs against exact /Applications targets before deletion
+# 2.7 - Enforce protected applications through a validated, case-normalized exact-match policy
+#       Recheck protection immediately before deletion and prevent ALLOWED_FOLDERS app bypasses
 ######################################################################################################
 #
 # Global "Common" variables
@@ -118,7 +120,8 @@ SD_ICON_FILE="SF=trash.fill, color=black, weight=light"
 SUPPORT_FILE_INSTALL_POLICY="install_SymFiles"
 DIALOG_INSTALL_POLICY="install_SwiftDialog"
 
-# The follow array lists the apps that the users are not allowed to remove.  If the apps show up in the list, they do not appear in the list of apps that can be deleted
+# Exact application names in this array are protected with case-insensitive, literal matching.
+# Use the Finder display name without the final .app bundle suffix; do not include paths.
 NOT_ALLOWED_APPS=(
     "Company Portal" 
 	"Falcon"
@@ -296,20 +299,48 @@ function is_valid_item_name ()
 	[[ -n "${item_name}" && "${item_name}" != "." && "${item_name}" != ".." && "${item_name}" != */* ]]
 }
 
-function is_protected_app_name ()
+function initialize_protected_app_policy ()
 {
-	# PURPOSE: Check whether an application name exactly matches the protected list.
-	# PARMS: $1 - Application name without the .app suffix.
-	# RETURN: 0 for a protected application; otherwise 1.
+	# PURPOSE: Validate and normalize the configured protected-application names.
+	# PARMS: NOT_ALLOWED_APPS
+	# RETURN: 0 with PROTECTED_APP_NAMES ready for exact matching; otherwise 1.
 
-	local app_name="$1"
-	local protected_name
+	local configured_name
+	local normalized_name
 
-	for protected_name in "${NOT_ALLOWED_APPS[@]}"; do
-		[[ "${app_name:l}" == "${protected_name:l}" ]] && return 0
+	PROTECTED_APP_NAMES=()
+	PROTECTED_POLICY_READY=0
+
+	for configured_name in "${NOT_ALLOWED_APPS[@]}"; do
+		if ! is_valid_item_name "${configured_name}"; then
+			logMe "ERROR: Invalid NOT_ALLOWED_APPS entry; expected an application name without a path: ${configured_name}"
+			PROTECTED_APP_NAMES=()
+			return 1
+		fi
+
+		normalized_name="${configured_name:l}"
+		PROTECTED_APP_NAMES[$normalized_name]=1
 	done
 
-	return 1
+	PROTECTED_POLICY_READY=1
+	return 0
+}
+
+function is_protected_app_name ()
+{
+	# PURPOSE: Check an application name against the normalized exact-match policy.
+	# PARMS: $1 - Application name without its final .app suffix.
+	# RETURN: 0 for a protected or invalid application; otherwise 1.
+
+	local app_name="$1"
+	local normalized_name
+
+	# An unavailable policy must fail closed rather than expose protected applications.
+	[[ ${PROTECTED_POLICY_READY:-0} -eq 1 ]] || return 0
+	is_valid_item_name "${app_name}" || return 0
+
+	normalized_name="${app_name:l}"
+	(( ${+PROTECTED_APP_NAMES[$normalized_name]} ))
 }
 
 function is_allowed_folder_name ()
@@ -322,6 +353,8 @@ function is_allowed_folder_name ()
 	local allowed_name
 
 	is_valid_item_name "${folder_name}" || return 1
+	# Application bundles must pass the application policy and cannot be reintroduced as folders.
+	[[ "${folder_name:l}" == *.app ]] && return 1
 	for allowed_name in "${ALLOWED_FOLDERS[@]}"; do
 		[[ "${folder_name}" == "${allowed_name}" ]] && return 0
 	done
@@ -382,6 +415,10 @@ function build_file_list_array ()
 
 	FILES_LIST=()
 	CANDIDATE_TYPES=()
+	if ! initialize_protected_app_policy; then
+		logMe "ERROR: Refusing to continue with an invalid protected-application policy."
+		return 1
+	fi
 
 	if [[ ! -d "${APPLICATIONS_DIR}" || -L "${APPLICATIONS_DIR}" ]]; then
 		logMe "ERROR: Applications directory is missing or is a symbolic link: ${APPLICATIONS_DIR}"
@@ -402,8 +439,8 @@ function build_file_list_array ()
 	done < <(/usr/bin/find "${APPLICATIONS_DIR}" -mindepth 1 -maxdepth 1 -type d -name '*.app' -print0)
 
 	for folder_name in "${ALLOWED_FOLDERS[@]}"; do
-		if ! is_valid_item_name "${folder_name}"; then
-			logMe "ERROR: Ignoring unsafe ALLOWED_FOLDERS entry: ${folder_name}"
+		if ! is_allowed_folder_name "${folder_name}"; then
+			logMe "ERROR: Ignoring unsafe or application-bundle ALLOWED_FOLDERS entry: ${folder_name}"
 			continue
 		fi
 
@@ -791,6 +828,8 @@ typeset -gA CANDIDATE_TYPES
 typeset -gA APPROVED_TARGETS
 typeset -gA APPROVED_LABELS
 typeset -gA APPROVED_TYPES
+typeset -gA PROTECTED_APP_NAMES
+typeset -gi PROTECTED_POLICY_READY=0
 typeset -g messagebody
 
 # Loading this file for unit tests exposes functions without running the Jamf workflow.

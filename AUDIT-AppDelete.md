@@ -129,12 +129,12 @@ Verification command:
 zsh AppDelete/tests/AppDeleteSecurityTests.zsh
 ```
 
-Result: `14 passed; 0 failed`.
+Current full-suite result: `20 passed; 0 failed`.
 
 ### AD-002: The protected-application control is unreliable and incorrectly documented
 
 - Severity: Medium
-- Status: Remediated in the current working tree as defense in depth for AD-001
+- Status: Remediated in the current working tree; pending commit and staged-device UI verification
 - Affected lines: README line 5; script lines 101-108 and 239-245
 
 The README instructs administrators to add protected applications to `MANAGED_APPS`, but the implementation reads `NOT_ALLOWED_APPS`. Following the README therefore does not update the list used by the script.
@@ -163,6 +163,18 @@ The script does not enforce the protected-app list again at deletion time. It mu
 - Define and consistently apply the intended case-sensitivity rules.
 - Recheck protected applications immediately before deletion.
 - Add regression tests for exact matches, case variants, prefixes, suffixes, and names containing spaces.
+
+#### Remediation implemented
+
+- Corrected the README to reference `NOT_ALLOWED_APPS` and documented its exact configuration contract.
+- Replaced substring replacement with a validated, case-normalized associative policy set.
+- Made matching case-insensitive, exact, and literal; glob-like configuration characters have no pattern behavior.
+- Made invalid path-like protected entries fail closed instead of silently weakening protection.
+- Excluded protected applications during discovery and rechecked the policy immediately before deletion.
+- Prevented names ending in `.app` from being reintroduced through `ALLOWED_FOLDERS`.
+- Added regression tests for case variants, exact-versus-substring behavior, special characters, duplicate normalized names, invalid configuration, deletion-time enforcement, and folder-list bypasses.
+
+Verification result: `20 passed; 0 failed`.
 
 ### AD-003: The script invokes opaque Jamf policies not documented in the README
 

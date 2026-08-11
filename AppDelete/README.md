@@ -2,9 +2,9 @@
 
 This script is designed to allow non-admin users the ability to remove applications and folders from the /Applications folder. 
 
-You can control what applications they are not allowed to remove by putting items into the `NOT_ALLOWED_APPS` array.
+You can control what applications users are not allowed to remove by putting their exact Finder names into the `NOT_ALLOWED_APPS` array. Omit the final `.app` bundle suffix. Matching is case-insensitive and literal, so `Falcon` protects only `Falcon`, not `Falcon Sensor`, and characters such as `*` are not treated as patterns. An empty array intentionally permits every discovered application; an invalid path-like entry causes AppDelete to fail closed without presenting deletion choices.
 
-You can also include folders that are allowed to be deleted by putting direct folder names into the `ALLOWED_FOLDERS` array. Paths, `.` and `..` are rejected.
+You can also include folders that are allowed to be deleted by putting direct folder names into the `ALLOWED_FOLDERS` array. Paths, `.`, `..`, symbolic links, and names ending in `.app` are rejected. Applications cannot bypass `NOT_ALLOWED_APPS` through the folder configuration.
 
 It automatically excludes the preinstalled items that come with the OS _[SIP Protected]_.
 
@@ -17,6 +17,7 @@ AppDelete runs as root so non-admin users can remove approved items. The script 
 - Selected IDs and their exact targets remain in process memory.
 - The same validated selection snapshot is used for confirmation and deletion.
 - Every target is revalidated as an approved, non-symlinked direct child of `/Applications` before any item in the batch is deleted.
+- Protected-application policy is enforced during discovery and immediately before deletion.
 
 Run the security regression suite after changing discovery, selection, or deletion behavior:
 
@@ -63,3 +64,6 @@ and give them an option to do it again (and again)
 | 2.6 | Prevented local selection-file tampering and path traversal |
 || Selection state is held in memory and represented by opaque dialog IDs |
 || Added exact target validation, root-only temporary state, cleanup traps, and security regression tests |
+| 2.7 | Replaced protected-app substring removal with validated, case-insensitive exact matching |
+|| Added fail-closed policy initialization and deletion-time protection checks |
+|| Prevented application bundles from bypassing protection through `ALLOWED_FOLDERS` |

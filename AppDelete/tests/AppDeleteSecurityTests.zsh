@@ -88,6 +88,41 @@ function assert_not_exists ()
 	[[ ! -e "$1" && ! -L "$1" ]] || fail "Expected path to be absent: $1"
 }
 
+function assert_candidate_present ()
+{
+	# PURPOSE: Assert that an exact filesystem path is present in FILES_LIST.
+	# PARMS: $1 - Expected candidate path.
+	# RETURN: 0 when present; otherwise 1.
+
+	local expected_path="$1"
+	local candidate_path
+
+	for candidate_path in "${FILES_LIST[@]}"; do
+		[[ "${candidate_path}" == "${expected_path}" ]] && return 0
+	done
+
+	fail "Expected deletion candidate: ${expected_path}"
+}
+
+function assert_candidate_absent ()
+{
+	# PURPOSE: Assert that an exact filesystem path is absent from FILES_LIST.
+	# PARMS: $1 - Disallowed candidate path.
+	# RETURN: 0 when absent; otherwise 1.
+
+	local disallowed_path="$1"
+	local candidate_path
+
+	for candidate_path in "${FILES_LIST[@]}"; do
+		if [[ "${candidate_path}" == "${disallowed_path}" ]]; then
+			fail "Unexpected deletion candidate: ${disallowed_path}"
+			return 1
+		fi
+	done
+
+	return 0
+}
+
 function reset_fixture ()
 {
 	# PURPOSE: Reset AppDelete globals and create an empty isolated Applications directory.
@@ -108,6 +143,8 @@ function reset_fixture ()
 	APPROVED_TARGETS=()
 	APPROVED_LABELS=()
 	APPROVED_TYPES=()
+	PROTECTED_APP_NAMES=()
+	PROTECTED_POLICY_READY=0
 	TEST_LOG_MESSAGES=()
 	messagebody=""
 	NOT_ALLOWED_APPS=("Company Portal" "Falcon" "Jamf Connect" "Self Service" "Self Service+" "ZScaler")
@@ -372,6 +409,115 @@ function test_case_variant_of_protected_app_is_excluded ()
 	assert_equal "${APPLICATIONS_DIR}/Calculator.app" "${FILES_LIST[1]}" "remaining candidate"
 }
 
+function test_protected_matching_is_exact_not_substring ()
+{
+	# PURPOSE: Verify prefixes and suffixes of a protected name remain independent apps.
+	# PARMS: None
+	# RETURN: 0 when only the exact protected application is excluded.
+
+	reset_fixture || return 1
+	NOT_ALLOWED_APPS=("Falcon")
+	create_test_app "Falcon" || return 1
+	create_test_app "Falcon Sensor" || return 1
+	create_test_app "My Falcon" || return 1
+	build_file_list_array || return 1
+
+	assert_equal "2" "${#FILES_LIST}" "candidate count" || return 1
+	assert_candidate_absent "${APPLICATIONS_DIR}/Falcon.app" || return 1
+	assert_candidate_present "${APPLICATIONS_DIR}/Falcon Sensor.app" || return 1
+	assert_candidate_present "${APPLICATIONS_DIR}/My Falcon.app"
+}
+
+function test_protected_names_treat_glob_characters_literally ()
+{
+	# PURPOSE: Verify configuration characters such as brackets and stars are not patterns.
+	# PARMS: None
+	# RETURN: 0 when only the literal protected name is excluded.
+
+	reset_fixture || return 1
+	NOT_ALLOWED_APPS=('Agent [Prod]*')
+	create_test_app 'Agent [Prod]*' || return 1
+	create_test_app "Agent Prod" || return 1
+	build_file_list_array || return 1
+
+	assert_equal "1" "${#FILES_LIST}" "candidate count" || return 1
+	assert_candidate_absent "${APPLICATIONS_DIR}/Agent [Prod]*.app" || return 1
+	assert_candidate_present "${APPLICATIONS_DIR}/Agent Prod.app"
+}
+
+function test_invalid_protected_configuration_fails_closed ()
+{
+	# PURPOSE: Verify a path-like NOT_ALLOWED_APPS entry aborts candidate discovery.
+	# PARMS: None
+	# RETURN: 0 when the policy remains unavailable and no candidates are exposed.
+
+	reset_fixture || return 1
+	NOT_ALLOWED_APPS=("Self Service" "../Falcon")
+	create_test_app "Calculator" || return 1
+
+	assert_failure build_file_list_array || return 1
+	assert_equal "0" "${PROTECTED_POLICY_READY}" "protected-policy readiness" || return 1
+	assert_equal "0" "${#FILES_LIST}" "candidate count"
+}
+
+function test_duplicate_protected_names_are_normalized_once ()
+{
+	# PURPOSE: Verify case variants normalize into one exact protected-policy entry.
+	# PARMS: None
+	# RETURN: 0 when duplicate variants collapse and remain protected.
+
+	reset_fixture || return 1
+	NOT_ALLOWED_APPS=("Self Service" "SELF SERVICE" "self service")
+	initialize_protected_app_policy || return 1
+
+	assert_equal "1" "${#PROTECTED_APP_NAMES}" "normalized protected-name count" || return 1
+	assert_success is_protected_app_name "SeLf SeRvIcE"
+}
+
+function test_protection_is_rechecked_before_deletion ()
+{
+	# PURPOSE: Verify a target newly protected after discovery fails deletion validation.
+	# PARMS: None
+	# RETURN: 0 when the protected application survives.
+
+	local app_path
+	local item_id
+	local output
+
+	reset_fixture || return 1
+	NOT_ALLOWED_APPS=()
+	app_path="${APPLICATIONS_DIR}/Calculator.app"
+	create_test_app "Calculator" || return 1
+	prepare_dialog_configuration || return 1
+	find_item_id_by_label "Calculator" || return 1
+	item_id="${REPLY}"
+	dialog_output_for_selection "${item_id}"
+	output="${REPLY}"
+	parse_dialog_selection "${output}" || return 1
+	prepare_confirmation || return 1
+
+	NOT_ALLOWED_APPS=("Calculator")
+	initialize_protected_app_policy || return 1
+	assert_failure delete_files || return 1
+	assert_exists "${app_path}"
+}
+
+function test_allowed_folders_cannot_reintroduce_app_bundles ()
+{
+	# PURPOSE: Verify ALLOWED_FOLDERS cannot bypass application protection with a .app name.
+	# PARMS: None
+	# RETURN: 0 when the protected bundle remains absent from deletion candidates.
+
+	reset_fixture || return 1
+	NOT_ALLOWED_APPS=("Self Service")
+	ALLOWED_FOLDERS=("Self Service.app")
+	create_test_app "Self Service" || return 1
+	build_file_list_array || return 1
+
+	assert_equal "0" "${#FILES_LIST}" "candidate count" || return 1
+	assert_candidate_absent "${APPLICATIONS_DIR}/Self Service.app"
+}
+
 function test_confirmation_snapshot_ignores_legacy_selection_file ()
 {
 	# PURPOSE: Verify post-confirmation file tampering cannot alter the deletion target.
@@ -538,6 +684,12 @@ run_test test_path_traversal_mapping_is_rejected
 run_test test_unsafe_allowed_folder_configuration_is_rejected
 run_test test_symlinked_allowed_folder_is_rejected
 run_test test_case_variant_of_protected_app_is_excluded
+run_test test_protected_matching_is_exact_not_substring
+run_test test_protected_names_treat_glob_characters_literally
+run_test test_invalid_protected_configuration_fails_closed
+run_test test_duplicate_protected_names_are_normalized_once
+run_test test_protection_is_rechecked_before_deletion
+run_test test_allowed_folders_cannot_reintroduce_app_bundles
 run_test test_confirmation_snapshot_ignores_legacy_selection_file
 run_test test_tampered_target_map_fails_before_any_deletion
 run_test test_target_replaced_by_symlink_is_rejected
