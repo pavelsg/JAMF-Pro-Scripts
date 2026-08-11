@@ -35,6 +35,8 @@
 #       Rename the branding-assets event and make its local asset directory configurable
 # 2.9 - Track and report successful and failed deletions independently
 #       Preserve a nonzero session result after any requested deletion fails
+# 3.0 - Generate and parse Swift Dialog JSON with Apple's structured jq processor
+#       Enforce a bounded, flat, duplicate-free opaque-ID/Boolean response schema
 ######################################################################################################
 #
 # Global "Common" variables
@@ -180,6 +182,8 @@ SD_ICON_FILE="SF=trash.fill, color=black, weight=light"
 
 JAMF_BINARY="/usr/local/bin/jamf"
 REMOVE_BINARY="/bin/rm"
+JSON_PROCESSOR_BINARY="/usr/bin/jq"
+MAX_DIALOG_RESPONSE_BYTES=1048576
 BRANDING_ASSETS_INSTALL_POLICY="install_BrandingAssets"
 DIALOG_INSTALL_POLICY="install_SwiftDialog"
 
@@ -372,6 +376,34 @@ function check_branding_assets ()
 	return 0
 }
 
+function check_json_processor ()
+{
+	# PURPOSE: Verify the required Apple jq binary supports strict streaming JSON parsing.
+	# PARMS: JSON_PROCESSOR_BINARY
+	# RETURN: 0 when the processor passes a functional probe; otherwise 1.
+
+	local probe_output
+	local jq_filter='if length == 2 and (.[0] | length) == 1 and (.[0][0] | type) == "string" and (.[1] | type) == "boolean" then [.[0][0], (.[1] | tostring)] | @tsv elif length == 1 then empty else error("expected a flat object of boolean fields") end'
+
+	if [[ ! -x "${JSON_PROCESSOR_BINARY}" ]]; then
+		logMe "ERROR: Required JSON processor is unavailable at ${JSON_PROCESSOR_BINARY}."
+		return 1
+	fi
+
+	probe_output=$(/usr/bin/printf '%s' '{"probe":true,"probe":false}' |
+		"${JSON_PROCESSOR_BINARY}" --stream -er "${jq_filter}" 2>/dev/null) || {
+		logMe "ERROR: JSON processor failed its structured-parser probe: ${JSON_PROCESSOR_BINARY}"
+		return 1
+	}
+
+	if [[ "${probe_output}" != $'probe\ttrue\nprobe\tfalse' ]]; then
+		logMe "ERROR: JSON processor did not preserve duplicate fields during its parser probe."
+		return 1
+	fi
+
+	return 0
+}
+
 function cleanup_and_exit ()
 {
 	# PURPOSE: Exit without allowing a prior deletion failure to be downgraded to success.
@@ -493,42 +525,6 @@ function is_allowed_folder_name ()
 	return 1
 }
 
-function json_escape ()
-{
-	# PURPOSE: Escape a filesystem label for safe use as a JSON string value.
-	# PARMS: $1 - Unescaped string.
-	# RETURN: 0 and the escaped value in REPLY.
-
-	local input="$1"
-	local output=""
-	local character
-	local unicode_escape
-	local -i index
-	local -i codepoint
-
-	for (( index = 1; index <= ${#input}; index++ )); do
-		character="${input[index]}"
-		case "${character}" in
-			'"') output+='\"' ;;
-			'\') output+='\\' ;;
-			$'\b') output+='\b' ;;
-			$'\f') output+='\f' ;;
-			$'\n') output+='\n' ;;
-			$'\r') output+='\r' ;;
-			$'\t') output+='\t' ;;
-			[[:cntrl:]])
-				codepoint=$(printf '%d' "'${character}")
-				printf -v unicode_escape '\\u%04x' "${codepoint}"
-				output+="${unicode_escape}"
-				;;
-			*) output+="${character}" ;;
-		esac
-	done
-
-	REPLY="${output}"
-	return 0
-}
-
 function build_file_list_array ()
 {
 	# PURPOSE: Build exact application and configured-folder targets under APPLICATIONS_DIR.
@@ -593,73 +589,66 @@ function build_file_list_array ()
 
 function construct_display_list ()
 {
-	# PURPOSE: Build valid dialog JSON and bind opaque item IDs to exact approved targets.
-	# PARMS: FILES_LIST, CANDIDATE_TYPES, JSON_OPTIONS
+	# PURPOSE: Build dialog JSON with jq and bind opaque item IDs to exact approved targets.
+	# PARMS: FILES_LIST, CANDIDATE_TYPES, JSON_OPTIONS, JSON_PROCESSOR_BINARY
 	# RETURN: 0 when at least one approved item is written; otherwise 1.
 
 	local target_path
 	local target_type
 	local display_name
 	local icon_path
-	local escaped_label
-	local escaped_icon
 	local item_id
-	local separator=""
 	local -i item_index=0
+	local -i record_index
+	local -a record_labels
+	local -a record_ids
+	local -a record_icons
+	local jq_filter='split("\u0000") | if .[-1] == "" then .[:-1] else error("incomplete dialog record") end | if (length % 3) != 0 then error("invalid dialog record width") else . end | {checkboxstyle: {style: "switch", size: "regular"}, checkbox: [range(0; length; 3) as $index | {label: .[$index], name: .[$index + 1], checked: false, disabled: false, icon: .[$index + 2]}]}'
 
 	APPROVED_TARGETS=()
 	APPROVED_LABELS=()
 	APPROVED_TYPES=()
 
-	[[ -n "${JSON_OPTIONS}" && -f "${JSON_OPTIONS}" ]] || return 1
+	[[ -n "${JSON_OPTIONS}" && -f "${JSON_OPTIONS}" && -x "${JSON_PROCESSOR_BINARY}" ]] || return 1
 
-	{
-		print -r -- '{'
-		print -r -- '  "checkboxstyle": {'
-		print -r -- '    "style": "switch",'
-		print -r -- '    "size": "regular"'
-		print -r -- '  },'
-		print -r -- '  "checkbox": ['
+	for target_path in "${FILES_LIST[@]}"; do
+		target_type="${CANDIDATE_TYPES[$target_path]-}"
+		case "${target_type}" in
+			application)
+				display_name="${target_path:t}"
+				display_name="${display_name%.app}"
+				icon_path="${target_path}"
+				;;
+			folder)
+				display_name="${target_path:t}"
+				icon_path="${ICON_FILES}/ApplicationsFolderIcon.icns"
+				;;
+			*)
+				continue
+				;;
+		esac
 
-		for target_path in "${FILES_LIST[@]}"; do
-			target_type="${CANDIDATE_TYPES[$target_path]-}"
-			case "${target_type}" in
-				application)
-					display_name="${target_path:t}"
-					display_name="${display_name%.app}"
-					icon_path="${target_path}"
-					;;
-				folder)
-					display_name="${target_path:t}"
-					icon_path="${ICON_FILES}/ApplicationsFolderIcon.icns"
-					;;
-				*)
-					continue
-					;;
-			esac
+		(( item_index++ ))
+		printf -v item_id 'appdelete_%04d' "${item_index}"
+		APPROVED_TARGETS[$item_id]="${target_path}"
+		APPROVED_LABELS[$item_id]="${display_name}"
+		APPROVED_TYPES[$item_id]="${target_type}"
+		record_labels+=("${display_name}")
+		record_ids+=("${item_id}")
+		record_icons+=("${icon_path}")
+	done
 
-			(( item_index++ ))
-			printf -v item_id 'appdelete_%04d' "${item_index}"
-			APPROVED_TARGETS[$item_id]="${target_path}"
-			APPROVED_LABELS[$item_id]="${display_name}"
-			APPROVED_TYPES[$item_id]="${target_type}"
-
-			json_escape "${display_name}"
-			escaped_label="${REPLY}"
-			json_escape "${icon_path}"
-			escaped_icon="${REPLY}"
-
-			print -rn -- "${separator}    {\"label\": \"${escaped_label}\", \"name\": \"${item_id}\", \"checked\": false, \"disabled\": false, \"icon\": \"${escaped_icon}\"}"
-			separator=$',\n'
+	(( item_index > 0 )) || return 1
+	if ! {
+		for (( record_index = 1; record_index <= item_index; record_index++ )); do
+			/usr/bin/printf '%s\0%s\0%s\0' "${record_labels[record_index]}" "${record_ids[record_index]}" "${record_icons[record_index]}" || return 1
 		done
-
-		print
-		print -r -- '  ]'
-		print -r -- '}'
-	} > "${JSON_OPTIONS}"
+	} | "${JSON_PROCESSOR_BINARY}" -Rse "${jq_filter}" > "${JSON_OPTIONS}"; then
+		return 1
+	fi
 
 	/bin/chmod 600 "${JSON_OPTIONS}" || return 1
-	(( item_index > 0 ))
+	return 0
 }
 
 function choose_files_to_delete ()
@@ -716,42 +705,51 @@ function choose_files_to_delete ()
 
 function parse_dialog_selection ()
 {
-	# PURPOSE: Parse the fixed-format Swift Dialog JSON response without trusting labels or paths.
+	# PURPOSE: Parse a bounded Swift Dialog response as a strict flat Boolean JSON object.
 	# PARMS: $1 - JSON response containing opaque appdelete_NNNN boolean fields.
 	# RETURN: 0 with selected IDs in SELECTED_ITEM_IDS; otherwise 1.
 
 	local dialog_output="$1"
-	local line
-	local compact_line
+	local parsed_output
 	local item_id
 	local selected_value
-	local selection_pattern='^[[:space:]]*"(appdelete_[0-9]+)"[[:space:]]*:[[:space:]]*(true|false)[[:space:]]*,?[[:space:]]*$'
+	local extra_value
+	local jq_filter='if length == 2 and (.[0] | length) == 1 and (.[0][0] | type) == "string" and (.[1] | type) == "boolean" then [.[0][0], (.[1] | tostring)] | @tsv elif length == 1 then empty else error("expected a flat object of boolean fields") end'
+	local -a parsed_selected_ids
 	local -A seen_items
+	local -i response_size=0
 	local -i parsed_count=0
 
 	SELECTED_ITEM_IDS=()
-	[[ -n "${dialog_output}" && ${#APPROVED_TARGETS} -gt 0 ]] || return 1
+	[[ -n "${dialog_output}" && ${#APPROVED_TARGETS} -gt 0 && -x "${JSON_PROCESSOR_BINARY}" ]] || return 1
 
-	while IFS= read -r line; do
-		compact_line="${line//[[:space:]]/}"
-		[[ -z "${compact_line}" || "${compact_line}" == "{" || "${compact_line}" == "}" ]] && continue
+	response_size=$(/usr/bin/printf '%s' "${dialog_output}" | /usr/bin/wc -c) || return 1
+	(( response_size > 0 && response_size <= MAX_DIALOG_RESPONSE_BYTES )) || return 1
 
-		if [[ "${line}" =~ ${selection_pattern} ]]; then
-			item_id="${match[1]}"
-			selected_value="${match[2]}"
-		else
-			return 1
-		fi
+	# Slurping is safe after the size bound and proves there is exactly one top-level object.
+	/usr/bin/printf '%s' "${dialog_output}" |
+		"${JSON_PROCESSOR_BINARY}" -se 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1 || return 1
+
+	# Streaming preserves duplicate keys, unlike ordinary object decoding.
+	parsed_output=$(/usr/bin/printf '%s' "${dialog_output}" |
+		"${JSON_PROCESSOR_BINARY}" --stream -er "${jq_filter}" 2>/dev/null) || return 1
+	[[ -n "${parsed_output}" ]] || return 1
+
+	while IFS=$'\t' read -r item_id selected_value extra_value; do
+		[[ -n "${item_id}" && -z "${extra_value}" ]] || return 1
+		[[ "${selected_value}" == "true" || "${selected_value}" == "false" ]] || return 1
 
 		(( ${+APPROVED_TARGETS[$item_id]} )) || return 1
 		(( ${+seen_items[$item_id]} )) && return 1
 		seen_items[$item_id]=1
 		(( parsed_count++ ))
 
-		[[ "${selected_value}" == "true" ]] && SELECTED_ITEM_IDS+=("${item_id}")
-	done <<< "${dialog_output}"
+		[[ "${selected_value}" == "true" ]] && parsed_selected_ids+=("${item_id}")
+	done <<< "${parsed_output}"
 
-	[[ ${parsed_count} -eq ${#APPROVED_TARGETS} ]]
+	[[ ${parsed_count} -eq ${#APPROVED_TARGETS} ]] || return 1
+	SELECTED_ITEM_IDS=("${parsed_selected_ids[@]}")
+	return 0
 }
 
 function validate_approved_target ()
@@ -1161,6 +1159,10 @@ if ! create_secure_temp_file; then
 	cleanup_and_exit 1
 fi
 
+if ! check_json_processor; then
+	logMe "ERROR: AppDelete cannot continue without Apple's structured JSON processor."
+	cleanup_and_exit 1
+fi
 if ! check_swift_dialog_install; then
 	logMe "ERROR: AppDelete cannot continue without a verified Swift Dialog installation."
 	cleanup_and_exit 1

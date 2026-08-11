@@ -201,6 +201,8 @@ function reset_fixture ()
 	messagebody=""
 	DELETION_RESULT_MESSAGE=""
 	REMOVE_BINARY="/bin/rm"
+	JSON_PROCESSOR_BINARY="/usr/bin/jq"
+	MAX_DIALOG_RESPONSE_BYTES=1048576
 	NOT_ALLOWED_APPS=("Company Portal" "Falcon" "Jamf Connect" "Self Service" "Self Service+" "ZScaler")
 	ALLOWED_FOLDERS=()
 	unset APPDELETE_TEST_REMOVE_FAIL_TARGET APPDELETE_TEST_REMOVE_NOOP_TARGET APPDELETE_TEST_REMOVE_EXIT
@@ -366,12 +368,15 @@ function test_secure_temp_file_permissions ()
 
 function test_valid_json_uses_opaque_ids ()
 {
-	# PURPOSE: Verify unusual labels are escaped and never used as output identifiers.
+	# PURPOSE: Verify jq preserves unusual labels while opaque IDs remain output identifiers.
 	# PARMS: None
-	# RETURN: 0 when generated JSON is valid and contains an opaque name.
+	# RETURN: 0 when generated JSON is valid and retains the exact label.
+
+	local unusual_name=$'Odd "Name"\\Utility\n雪 : true'
+	local extracted_label
 
 	reset_fixture || return 1
-	create_test_app 'Odd "Name"\Utility' || return 1
+	create_test_app "${unusual_name}" || return 1
 	prepare_dialog_configuration || return 1
 	/usr/bin/plutil -convert json -o /dev/null -- "${JSON_OPTIONS}" >/dev/null || {
 		fail "Generated dialog JSON is invalid"
@@ -381,6 +386,8 @@ function test_valid_json_uses_opaque_ids ()
 		fail "Opaque dialog ID is missing"
 		return 1
 	}
+	extracted_label=$(/usr/bin/plutil -extract checkbox.0.label raw -o - -- "${JSON_OPTIONS}") || return 1
+	assert_equal "${unusual_name}" "${extracted_label}" "structured JSON label"
 }
 
 function test_valid_selection_parser ()
@@ -402,6 +409,106 @@ function test_valid_selection_parser ()
 	output="${REPLY}"
 	parse_dialog_selection "${output}" || return 1
 	assert_equal "${first_id}" "${(j:,:)SELECTED_ITEM_IDS}" "selected IDs"
+}
+
+function test_structured_parser_accepts_compact_reordered_json ()
+{
+	# PURPOSE: Verify selection parsing is independent of whitespace, line layout, and key order.
+	# PARMS: None
+	# RETURN: 0 when compact reordered JSON produces the intended selected ID.
+
+	local calculator_id
+	local textedit_id
+
+	reset_fixture || return 1
+	create_test_app "Calculator" || return 1
+	create_test_app "TextEdit" || return 1
+	prepare_dialog_configuration || return 1
+	find_item_id_by_label "Calculator" || return 1
+	calculator_id="${REPLY}"
+	find_item_id_by_label "TextEdit" || return 1
+	textedit_id="${REPLY}"
+
+	parse_dialog_selection "{\"${textedit_id}\":false,\"${calculator_id}\":true}" || return 1
+	assert_equal "${calculator_id}" "${(j:,:)SELECTED_ITEM_IDS}" "compact reordered selection"
+}
+
+function test_structured_parser_rejects_invalid_shapes_and_types ()
+{
+	# PURPOSE: Verify jq enforces exactly one flat object containing only Boolean fields.
+	# PARMS: None
+	# RETURN: 0 when malformed documents and non-Boolean/nested values all fail closed.
+
+	local item_id
+
+	reset_fixture || return 1
+	create_test_app "Calculator" || return 1
+	prepare_dialog_configuration || return 1
+	item_id="${${(@k)APPROVED_TARGETS}[1]}"
+
+	assert_failure parse_dialog_selection '[' || return 1
+	assert_failure parse_dialog_selection '[]' || return 1
+	assert_failure parse_dialog_selection 'null' || return 1
+	assert_failure parse_dialog_selection "{\"${item_id}\":\"true\"}" || return 1
+	assert_failure parse_dialog_selection "{\"${item_id}\":1}" || return 1
+	assert_failure parse_dialog_selection "{\"${item_id}\":null}" || return 1
+	assert_failure parse_dialog_selection "{\"${item_id}\":{\"nested\":true}}" || return 1
+	assert_failure parse_dialog_selection "{\"${item_id}\":true}{\"${item_id}\":false}"
+}
+
+function test_invalid_selection_never_leaves_partial_state ()
+{
+	# PURPOSE: Verify a valid field before an invalid extra field cannot leak into selection state.
+	# PARMS: None
+	# RETURN: 0 when parser failure leaves SELECTED_ITEM_IDS empty.
+
+	local item_id
+
+	reset_fixture || return 1
+	create_test_app "Calculator" || return 1
+	prepare_dialog_configuration || return 1
+	item_id="${${(@k)APPROVED_TARGETS}[1]}"
+	SELECTED_ITEM_IDS=("attacker-controlled-state")
+
+	assert_failure parse_dialog_selection "{\"${item_id}\":true,\"appdelete_9999\":false}" || return 1
+	assert_equal "0" "${#SELECTED_ITEM_IDS}" "selection state after parser failure"
+}
+
+function test_dialog_response_size_limit_is_enforced ()
+{
+	# PURPOSE: Verify an oversized response is rejected before structured parsing.
+	# PARMS: None
+	# RETURN: 0 when a syntactically valid response above the configured bound fails.
+
+	local item_id
+	local valid_response
+
+	reset_fixture || return 1
+	create_test_app "Calculator" || return 1
+	prepare_dialog_configuration || return 1
+	item_id="${${(@k)APPROVED_TARGETS}[1]}"
+	valid_response="{\"${item_id}\":true}"
+	MAX_DIALOG_RESPONSE_BYTES=8
+	assert_failure parse_dialog_selection "${valid_response}"
+}
+
+function test_json_processor_dependency_is_fail_closed ()
+{
+	# PURPOSE: Verify the Apple jq dependency is probed and cannot silently disappear.
+	# PARMS: None
+	# RETURN: 0 when the real processor passes and a missing processor fails both boundaries.
+
+	local item_id
+
+	reset_fixture || return 1
+	assert_success check_json_processor || return 1
+	create_test_app "Calculator" || return 1
+	prepare_dialog_configuration || return 1
+	item_id="${${(@k)APPROVED_TARGETS}[1]}"
+	JSON_PROCESSOR_BINARY="${TEST_ROOT}/missing-jq"
+
+	assert_failure check_json_processor || return 1
+	assert_failure parse_dialog_selection "{\"${item_id}\":true}"
 }
 
 function test_traversal_payload_is_rejected ()
@@ -1094,6 +1201,11 @@ trap cleanup_test_root EXIT HUP INT TERM
 run_test test_secure_temp_file_permissions
 run_test test_valid_json_uses_opaque_ids
 run_test test_valid_selection_parser
+run_test test_structured_parser_accepts_compact_reordered_json
+run_test test_structured_parser_rejects_invalid_shapes_and_types
+run_test test_invalid_selection_never_leaves_partial_state
+run_test test_dialog_response_size_limit_is_enforced
+run_test test_json_processor_dependency_is_fail_closed
 run_test test_traversal_payload_is_rejected
 run_test test_unknown_opaque_id_is_rejected
 run_test test_duplicate_or_missing_ids_are_rejected

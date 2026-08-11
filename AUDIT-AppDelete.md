@@ -10,7 +10,7 @@
 
 ### Remediation update
 
-AD-001 and AD-002 were remediated after the original audit. AD-003 and AD-004 repository-side remediations were implemented in the current working tree on 2026-08-11. The original findings below describe commit `43b3561`; each "Remediation implemented" section records the replacement behavior and verification results. Jamf Pro policy definitions remain outside the repository and require deployment-specific review.
+AD-001 and AD-002 were remediated after the original audit. AD-003, AD-004, and AD-005 repository-side remediations were implemented in the current working tree on 2026-08-11. The original findings below describe commit `43b3561`; each "Remediation implemented" section records the replacement behavior and verification results. Jamf Pro policy definitions remain outside the repository and require deployment-specific review.
 
 ## Executive summary
 
@@ -129,7 +129,7 @@ Verification command:
 zsh AppDelete/tests/AppDeleteSecurityTests.zsh
 ```
 
-Current full-suite result: `33 passed; 0 failed`.
+Current full-suite result: `38 passed; 0 failed`.
 
 ### AD-002: The protected-application control is unreliable and incorrectly documented
 
@@ -174,7 +174,7 @@ The script does not enforce the protected-app list again at deletion time. It mu
 - Prevented names ending in `.app` from being reintroduced through `ALLOWED_FOLDERS`.
 - Added regression tests for case variants, exact-versus-substring behavior, special characters, duplicate normalized names, invalid configuration, deletion-time enforcement, and folder-list bypasses.
 
-Verification result: `33 passed; 0 failed`.
+Verification result: `38 passed; 0 failed`.
 
 ### AD-003: The script invokes opaque Jamf policies not documented in the README
 
@@ -211,7 +211,7 @@ Repository-wide usage shows that the legacy `install_SymFiles` event is intended
 - Check the Jamf command result and verify the required Swift Dialog or banner postcondition. AppDelete exits nonzero before showing deletion choices if either dependency remains unavailable.
 - Added isolated regression tests for default and custom branding paths, invalid configurations, renamed event arguments, nonzero policy results, and successful policies that fail to install the expected dependency.
 
-Verification result: `33 passed; 0 failed`.
+Verification result: `38 passed; 0 failed`.
 
 The actual `install_SwiftDialog` and `install_BrandingAssets` policy payloads cannot be verified from this repository. Their server-side review remains a release prerequisite rather than a code remediation item.
 
@@ -243,13 +243,13 @@ This can conceal permission failures, immutable files, filesystem errors, or par
 - Preserve a cumulative session-failure flag. Once any requested deletion fails, every later exit path resolves to a nonzero status even if the user retries or cancels afterward.
 - Added deterministic regression tests for partial success, nonzero removal-command status, a misleading zero status with a remaining target, accurate logs/dialog options, whole-batch validation failure, and cumulative process status.
 
-Verification result: `33 passed; 0 failed`.
+Verification result: `38 passed; 0 failed`.
 
 ### AD-005: Hand-built JSON and text parsing mishandle valid application names
 
 - Severity: Low, with defense-in-depth security implications
-- Status: Partially remediated; JSON escaping, literal suffix handling, original labels, and opaque output IDs are implemented
-- Affected lines: 226-284 and 286-336
+- Status: Remediated in the current working tree; pending staged-device UI verification
+- Affected lines in the remediated script: 185-186, 379-406, 590-650, 706-753, 1162-1165
 
 Application names are interpolated into JSON without JSON escaping. Swift Dialog output is then processed with `echo`, `grep`, `xargs`, `awk`, and `tr` instead of a structured JSON parser.
 
@@ -264,6 +264,19 @@ The application scan removes `.app` using the regular expression delimiter `.app
 - Preserve the original filename as an internal identifier; use a separate display label if needed.
 - Remove only a literal trailing `.app` suffix.
 - Add tests for unusual but valid macOS filenames.
+
+#### Remediation implemented
+
+- Replaced manual JSON string construction with Apple `/usr/bin/jq`. Display labels, opaque IDs, and icon paths are transferred to `jq` as NUL-delimited raw fields, so quotes, backslashes, newlines, Unicode, and JSON-like filename text never become JSON syntax.
+- Retained original filesystem labels and literal trailing `.app` removal while keeping deletion paths solely in the in-memory opaque-ID maps.
+- Replaced line-oriented regular-expression parsing with `jq` structured parsing.
+- Limit Swift Dialog responses to 1 MiB and require exactly one top-level object containing only flat string-keyed Boolean fields.
+- Use `jq --stream` so duplicate keys remain observable. The application then requires every issued opaque ID exactly once and rejects missing, unknown, duplicate, nested, or incorrectly typed fields.
+- Build selected IDs in temporary in-memory state and publish them only after the complete response passes validation, preventing partial selection state after a parser error.
+- Added a fail-closed startup probe for `/usr/bin/jq`. This fleet's oldest Mac supplies the Apple binary as part of its operating-system baseline, so AppDelete does not invoke another installation policy.
+- Added regression coverage for exact unusual-label preservation, compact and reordered JSON, malformed input, arrays/scalars, nested and non-Boolean values, multiple JSON documents, partial-state cleanup, oversized responses, duplicate keys, and missing parser behavior.
+
+Verification result: `38 passed; 0 failed`.
 
 ### AD-006: Temporary files can survive interrupted execution
 
