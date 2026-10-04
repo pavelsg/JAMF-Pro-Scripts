@@ -42,6 +42,8 @@ Relative directories, path traversal components, URLs, relative banner subpaths,
 
 Starting with version 3.2, the unconfigured banner path is `/Library/Application Support/JamfProScripts/BrandingAssets/SwiftDialog-Banner.png`. Update the package or Files and Processes payload behind `install_BrandingAssets` before deployment, or deploy managed overrides for the previous location. AppDelete checks the exact resolved path after the policy finishes and fails closed if the banner is absent or unreadable.
 
+The repository's [generic file-package builder](../Packaging/README.md) can create the branding package without embedding AppDelete-specific behavior. Supply the banner source, resolved installation path, mode `0644`, an organization-owned package identifier, and a release version.
+
 ### Deletion safety
 
 AppDelete runs as root so non-admin users can remove approved items. The script therefore treats Swift Dialog output as untrusted:
